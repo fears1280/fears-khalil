@@ -32,7 +32,7 @@ def load_session_data():
     return {}
 
 # ---------------------------------------------------------------------------
-# 🔐 الحارس الخلفي: يتصل بـ MetaApi، يقرأ الهيستوري اليومي، ويحدث الكاش
+# 🔐 الحارس الخلفي: معزول ومحمي بالكامل لضمان عدم اختفاء القراءة أبداً
 # ---------------------------------------------------------------------------
 def start_risk_monitor():
     def monitor_worker():
@@ -70,57 +70,63 @@ def start_risk_monitor():
                             await connection.connect()
                             await connection.wait_synchronized()
                             
+                            # 📈 1. جلب البيانات الأساسية (مضمونة ولا تتأثر بالهيستوري)
                             account_info = await connection.get_account_information()
                             positions = await connection.get_positions()
                             
-                            # 📊 1. جلب الهيستوري اليومي (منذ بداية اليوم الحالي 00:00 UTC)
-                            now = datetime.utcnow()
-                            start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                            deals = await connection.get_deals_by_time_range(start_of_today, now)
-                            
-                            # حساب صافي الأرباح المغلقة من الهيستوري اليومي تشمل الكوميشن والسواب
-                            daily_history_profit = 0.0
-                            for deal in deals:
-                                # نتأكد أن الصفقة لها تأثير مالي (ربح/خسارة، عمولة، سواب)
-                                profit = float(deal.get('profit', 0.0))
-                                commission = float(deal.get('commission', 0.0))
-                                swap = float(deal.get('swap', 0.0))
-                                daily_history_profit += (profit + commission + swap)
-                            
-                            # 📈 2. الحسابات والمؤشرات الحية
                             balance = float(account_info.get('balance', 0.0))
                             equity = float(account_info.get('equity', 0.0))
-                            floating_pnl = equity - balance # الأرباح العائمة حالياً للي بربح وخسر بالصفقات المفتوحة
+                            floating_pnl = equity - balance
                             
-                            # حساب الرصيد الابتدائي لليوم بناءً على الهيستوري
-                            starting_balance = balance - daily_history_profit
-                            
-                            # التقدم الإجمالي اليومي بالنسبة المئوية
-                            overall_growth = (daily_history_profit / starting_balance * 100) if starting_balance > 0 else 0.0
-                            
-                            # حساب التراجع الحالي (Drawdown)
                             drawdown = ((balance - equity) / balance * 100) if balance > equity else 0.0
                             open_trades = len(positions)
                             remaining_trades = max(0, 4 - open_trades)
                             
-                            # 🎯 المجموع الإجمالي لأرباح وخسائر اليوم (المغلق + العائم حالياً) لحماية الحساب بدقة
+                            # قيم افتراضية أولية للهيستوري والنمو لضمان عدم حدوث كراش
+                            daily_history_profit = 0.0
+                            overall_growth = 0.0
+                            
+                            # 📊 2. جلب الهيستوري والنمو اليومي (داخل بلوك معزول وآمن تماماً)
+                            try:
+                                now = datetime.utcnow()
+                                start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                                deals = await connection.get_deals_by_time_range(start_of_today, now)
+                                
+                                if deals:
+                                    for deal in deals:
+                                        profit = float(deal.get('profit', 0.0))
+                                        commission = float(deal.get('commission', 0.0))
+                                        swap = float(deal.get('swap', 0.0))
+                                        daily_history_profit += (profit + commission + swap)
+                                    
+                                    # احتساب الرصيد الابتدائي لليوم بناءً على الهيستوري المغلق
+                                    starting_balance = balance - daily_history_profit
+                                    if starting_balance > 0:
+                                        overall_growth = (daily_history_profit / starting_balance) * 100
+                            except Exception as history_error:
+                                # في حال فشل الهيستوري لأي سبب، نطبخ القيم الافتراضية ولا نجعل السيرفر يعلق
+                                print(f"⚠️ تنبيه: تعذر جلب الهيستوري اليومي حالياً: {history_error}")
+                                daily_history_profit = 0.0
+                                overall_growth = 0.0
+
+                            # المجموع الإجمالي الفعلي لحماية الحساب (الهيستوري المغلق + العائم المفتوح)
                             total_daily_pnl = daily_history_profit + floating_pnl
                             
-                            # تحديث الكاش للفلوتر
+                            # 🎯 3. تحديث الكاش فوراً (البيانات ستصل للفلوتر رغماً عن أي خطأ)
                             session["latest_stats"] = {
                                 "is_locked": False,
                                 "balance": balance,
                                 "equity": equity,
                                 "drawdown_percent": max(0.0, float(drawdown)),
-                                "current_pnl": float(floating_pnl),       # صفقات مفتوحة حالياً
-                                "daily_profit": float(daily_history_profit), # صفقات مغلقة من الهيستوري
+                                "current_pnl": float(floating_pnl),
+                                "daily_profit": float(daily_history_profit), 
                                 "open_trades": open_trades,
                                 "remaining_trades": remaining_trades,
-                                "overall_growth": float(overall_growth)    # نسبة النمو اليومي من الهيستوري
+                                "overall_growth": float(overall_growth)
                             }
                             save_session_data(session)
                             
-                            # 🛡️ 3. فحص الأهداف بناء على إجمالي اليوم (مغلق + عائم)
+                            # 🛡️ 4. فحص حماية الحساب والمخاطر
                             profit_target = float(session.get("profit_target", 0.0))
                             max_loss = float(session.get("max_loss", 0.0))
                             lock_minutes = int(session.get("lock_duration_minutes", 60))
@@ -128,10 +134,8 @@ def start_risk_monitor():
                             trigger_lock = False
                             if profit_target > 0 and total_daily_pnl >= profit_target:
                                 trigger_lock = True
-                                print(f"🎯 تحقق هدف أرباح اليوم (مغلق+عائم): {total_daily_pnl}$")
                             if max_loss > 0 and total_daily_pnl <= -abs(max_loss):
                                 trigger_lock = True
-                                print(f"🛑 تحقق حد خسارة اليوم (مغلق+عائم): {total_daily_pnl}$")
                             
                             if trigger_lock:
                                 await connection.close_all_positions()
@@ -152,10 +156,10 @@ def start_risk_monitor():
                                 }
                                 save_session_data(session)
                                 await account.undeploy()
-                                print(f"🔒 تم قفل الحساب وفصله بنجاح.")
+                                print(f"🔒 تم قفل وتأمين الحساب بنجاح.")
                                 
                 except Exception as e:
-                    print(f"❌ خطأ الحارس: {e}")
+                    print(f"❌ خطأ الحارس العام: {e}")
                 await asyncio.sleep(3)
 
         loop = asyncio.new_event_loop()
@@ -168,7 +172,7 @@ def start_risk_monitor():
 start_risk_monitor()
 
 # ---------------------------------------------------------------------------
-# 🚀 الروابط (Endpoints)
+# 🚀 الروابط الثابتة والآمنة
 # ---------------------------------------------------------------------------
 
 @app.route('/api/connect', methods=['POST'])
