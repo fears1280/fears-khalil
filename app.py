@@ -4,7 +4,7 @@ import asyncio
 import os
 import json
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
@@ -20,7 +20,7 @@ def run_async(coro):
 
 def save_session_data(data):
     with open(SESSION_FILE, "w") as f:
-        json.dump(data, f)
+        json.dump(data, f, indent=2)
 
 def load_session_data():
     if os.path.exists(SESSION_FILE):
@@ -32,8 +32,6 @@ def load_session_data():
     return {}
 
 # ---------------------------------------------------------------------------
-# 🔐 الحارس الخلفي: يتصل بـ MetaApi، يحسب المؤشرات، ويحفظ كاش للفلوتر
-# ---------------------------------------------------------------------------
 def start_risk_monitor():
     def monitor_worker():
         async def check_risk_loop():
@@ -44,26 +42,27 @@ def start_risk_monitor():
                     is_locked = session.get("is_locked", False)
                     
                     if account_id:
-                        # 1. التحقق من انتهاء مدة القفل لإعادة التفعيل
+                        # التحقق من انتهاء القفل
                         if is_locked:
                             lock_until_str = session.get("lock_until")
                             if lock_until_str:
                                 lock_until = datetime.fromisoformat(lock_until_str)
-                                if datetime.utcnow() >= lock_until:
-                                    print("🔓 انتهت مدة القفل! إعادة تفعيل حساب الميتا...")
-                                    token = os.getenv("METAAPI_TOKEN")
-                                    api = MetaApi(token)
-                                    account = await api.metatrader_account_api.get_account(account_id)
-                                    await account.deploy()
+                                if datetime.now(timezone.utc) >= lock_until:
+                                    print("🔓 انتهت مدة القفل!")
                                     session["is_locked"] = False
                                     session["lock_until"] = None
-                                    session["latest_stats"] = None # تصفير الكاش القديم لتحديثه
+                                    session["latest_stats"] = None
                                     save_session_data(session)
                             await asyncio.sleep(4)
                             continue
 
-                        # 2. جلب البيانات الحية وتحديث الكاش وفحص الأهداف
+                        # جلب البيانات
                         token = os.getenv("METAAPI_TOKEN")
+                        if not token:
+                            print("❌ METAAPI_TOKEN غير موجود")
+                            await asyncio.sleep(5)
+                            continue
+                            
                         api = MetaApi(token)
                         account = await api.metatrader_account_api.get_account(account_id)
                         
@@ -78,12 +77,10 @@ def start_risk_monitor():
                             balance = float(account_info.get('balance', 0.0))
                             equity = float(account_info.get('equity', 0.0))
                             current_pnl = equity - balance
-                            
-                            # حساب التراجع المئوي الحي
                             drawdown = ((balance - equity) / balance * 100) if balance > 0 else 0.0
                             remaining_trades = max(0, 4 - len(positions))
                             
-                            # تحديث الكاش فوراً ليقرأه الفلوتر بسرعة البرق بدون انتظار
+                            # تحديث الكاش
                             session["latest_stats"] = {
                                 "is_locked": False,
                                 "balance": balance,
@@ -94,7 +91,7 @@ def start_risk_monitor():
                             }
                             save_session_data(session)
                             
-                            # فحص الأهداف القياسية
+                            # فحص الأهداف
                             profit_target = float(session.get("profit_target", 0.0))
                             max_loss = float(session.get("max_loss", 0.0))
                             lock_minutes = int(session.get("lock_duration_minutes", 60))
@@ -110,13 +107,16 @@ def start_risk_monitor():
                                 print(f"🛑 حد الخسارة تحقق: {current_pnl}$")
                             
                             if trigger_lock:
-                                # تنفيذ خطة الطوارئ فورا وتصفية الحساب
-                                await connection.close_all_positions()
-                                lock_until_time = datetime.utcnow() + timedelta(minutes=lock_minutes)
+                                # إغلاق الصفقات
+                                positions = await connection.get_positions()
+                                for pos in positions:
+                                    await connection.close_position(pos['id'])
+                                    print(f"✓ تم إغلاق صفقة {pos['id']}")
+                                
+                                lock_until_time = datetime.now(timezone.utc) + timedelta(minutes=lock_minutes)
                                 
                                 session["is_locked"] = True
                                 session["lock_until"] = lock_until_time.isoformat()
-                                # تصفير الأرقام في الكاش لأن الحساب سيقفل
                                 session["latest_stats"] = {
                                     "is_locked": True,
                                     "balance": balance,
@@ -126,13 +126,11 @@ def start_risk_monitor():
                                     "remaining_trades": 0
                                 }
                                 save_session_data(session)
-                                
-                                await account.undeploy() # إغلاق برنامج الميتا وفصله تماماً
-                                print(f"🔒 تم قفل الحساب وفصل الميتا بنجاح حتى: {lock_until_time}")
+                                print(f"🔒 تم قفل الحساب حتى: {lock_until_time}")
                                 
                 except Exception as e:
-                    print(f"❌ خطأ في الحارس الخلفي: {e}")
-                await asyncio.sleep(3) # تحديث حي كل 3 ثوانٍ
+                    print(f"❌ خطأ: {e}")
+                await asyncio.sleep(3)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -144,7 +142,7 @@ def start_risk_monitor():
 start_risk_monitor()
 
 # ---------------------------------------------------------------------------
-# 🚀 الروابط البرمجية (Endpoints) المستجيبة فورياً للفلوتر
+# ✅ نقاط API متوافقة مع تطبيق فلاتر
 # ---------------------------------------------------------------------------
 
 @app.route('/api/connect', methods=['POST'])
@@ -153,7 +151,6 @@ def connect_user():
     login = data.get('login')
     password = data.get('password')
     server = data.get('server')
-    platform = data.get('platform', 'mt5')
     
     if not all([login, password, server]):
         return jsonify({"status": "error", "message": "جميع البيانات مطلوبة"}), 400
@@ -164,12 +161,10 @@ def connect_user():
         account = await api.metatrader_account_api.create_account({
             'name': f'Guardian_{login}',
             'type': 'cloud',
-            'platform': platform,
+            'platform': 'mt5',
             'login': str(login),
             'password': password,
             'server': server,
-            'magic': 999111,
-            'keywords': ['trading-guardian']
         })
         await account.deploy()
         await account.wait_connected()
@@ -188,23 +183,35 @@ def connect_user():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route('/api/set-targets', methods=['POST'])
-def set_targets():
+@app.route('/api/update-targets', methods=['POST'])  # ✅ متوافق مع التطبيق
+def update_targets():
     data = request.json or {}
     session = load_session_data()
     if not session.get("account_id"):
         return jsonify({"status": "error", "message": "لا يوجد حساب نشط"}), 400
-        
-    session["profit_target"] = float(data.get('profit_target', 0.0))
-    session["max_loss"] = float(data.get('max_loss', 0.0))
-    session["lock_duration_minutes"] = int(data.get('lock_duration_minutes', 60))
+    
+    # ✅ دعم أسماء الحقول من التطبيق
+    if 'daily_profit_target' in data:
+        session["profit_target"] = float(data['daily_profit_target'])
+    elif 'profit_target' in data:
+        session["profit_target"] = float(data['profit_target'])
+    
+    if 'daily_stop_loss' in data:
+        session["max_loss"] = float(data['daily_stop_loss'])
+    elif 'max_loss' in data:
+        session["max_loss"] = float(data['max_loss'])
+    
+    if 'lockout_hours' in data:
+        session["lock_duration_minutes"] = int(data['lockout_hours']) * 60
+    elif 'lock_duration_minutes' in data:
+        session["lock_duration_minutes"] = int(data['lock_duration_minutes'])
+    
     save_session_data(session)
-    return jsonify({"status": "success", "message": "تم تحديث الأهداف بنجاح"})
+    return jsonify({"status": "success", "message": "تم تحديث الأهداف"})
 
 
 @app.route('/api/account-stats', methods=['GET'])
 def get_account_stats():
-    """ ⚡ الرابط أصبح سريعاً جداً (يقرأ الكاش بلحظة دون الاتصال بـ MetaApi من الصفر) """
     session = load_session_data()
     
     if session.get("is_locked", False):
@@ -217,12 +224,10 @@ def get_account_stats():
             "remaining_trades": 0
         }), 200
 
-    # إرجاع الكاش المحدث الذي وفره الحارس الخلفي
     latest_stats = session.get("latest_stats")
     if latest_stats:
         return jsonify(latest_stats), 200
 
-    # في حال لم يكتمل التحديث الأول بعد
     return jsonify({
         "is_locked": False,
         "balance": 0.0,
@@ -235,10 +240,14 @@ def get_account_stats():
 
 @app.route('/api/emergency-close', methods=['POST'])
 def emergency_close():
+    data = request.json or {}
     session = load_session_data()
     account_id = session.get("account_id")
     if not account_id:
-        return jsonify({"status": "error", "message": "لم يتم العثور على حساب"}), 400
+        return jsonify({"status": "error", "message": "لا يوجد حساب"}), 400
+
+    lockout_hours = float(data.get('lockout_hours', 1))
+    reason = data.get('reason', 'غير محدد')
 
     async def close_all():
         token = os.getenv("METAAPI_TOKEN")
@@ -247,8 +256,17 @@ def emergency_close():
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized()
-        await connection.close_all_positions()
-        return {"status": "success", "message": "تم إغلاق الصفقات طارئاً"}
+        positions = await connection.get_positions()
+        for pos in positions:
+            await connection.close_position(pos['id'])
+        
+        session["is_locked"] = True
+        session["lock_until"] = (datetime.now(timezone.utc) + timedelta(hours=lockout_hours)).isoformat()
+        session["profit_target"] = 0
+        session["max_loss"] = 0
+        save_session_data(session)
+        
+        return {"status": "success", "message": f"تم الإغلاق: {reason}"}
 
     try:
         result = run_async(close_all())
@@ -263,5 +281,8 @@ def disconnect():
         os.remove(SESSION_FILE)
     return jsonify({"status": "success", "message": "Disconnected"}), 200
 
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    print("🟢 Trading Guardian - MetaApi Cloud")
+    print("تأكد من تعيين METAAPI_TOKEN")
+    app.run(host='0.0.0.0', port=5000, debug=False)
