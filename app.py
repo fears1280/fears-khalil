@@ -31,7 +31,7 @@ def load_session_data():
                 return {}
     return {}
 
-# 🛡️ دالة مساعدة لإغلاق كافة الصفقات بشكل صحيح عبر أوامر عكسية في MetaApi
+# 🛡️ دالة إغلاق كافة الصفقات بشكل صحيح عبر أوامر عكسية في MetaApi
 async def close_all_account_positions(connection):
     try:
         positions = await connection.get_positions()
@@ -123,7 +123,7 @@ def start_risk_monitor():
 
                             total_daily_pnl = daily_history_profit + floating_pnl
                             
-                            # تحديث الكاش مع مطابقة اسم مفتاح التراجع مع الفلوتر (total_progress_drawdown)
+                            # حفظ البيانات بالكامل وبالمفاتيح الصحيحة المتوافقة مع الفلوتر
                             session["latest_stats"] = {
                                 "is_locked": False,
                                 "balance": balance,
@@ -150,16 +150,18 @@ def start_risk_monitor():
                             if trigger_lock:
                                 print("🛑 تم رصد اختراق الأهداف من الحارس التلقائي! جاري التصفية...")
                                 await close_all_account_positions(connection)
-                                await asyncio.sleep(3) # مهلة تأكيد الإغلاق في السيرفر قبل الـ undeploy
+                                await asyncio.sleep(3) 
                                 
                                 lock_until_time = datetime.utcnow() + timedelta(minutes=lock_minutes)
                                 session["is_locked"] = True
                                 session["lock_until"] = lock_until_time.isoformat()
-                                session["latest_stats"]["is_locked"] = True
+                                # تحديث حالة الـ Lock داخل الكاش للحفاظ على الأرقام التاريخية
+                                if session.get("latest_stats"):
+                                    session["latest_stats"]["is_locked"] = True
                                 save_session_data(session)
                                 
                                 await account.undeploy()
-                                print(f"🔒 تم قفل الحساب بنجاح.")
+                                print(f"🔒 تم قفل الحساب بنجاح مع الحفاظ على الإحصائيات الأخيرة.")
                                 
                 except Exception as e:
                     print(f"❌ خطأ الحارس العام: {e}")
@@ -175,7 +177,7 @@ def start_risk_monitor():
 start_risk_monitor()
 
 # ---------------------------------------------------------------------------
-# 🚀 الروابط البرمجية (Endpoints) متوافقة 100% مع الفلوتر
+# 🚀 الروابط البرمجية (Endpoints)
 # ---------------------------------------------------------------------------
 
 @app.route('/api/connect', methods=['POST'])
@@ -245,28 +247,21 @@ def connect_user():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# ✨ الرابط الأساسي المعدل والمصلح لحماية أرقامك من الاختفاء
 @app.route('/api/account-stats', methods=['GET'])
 def get_account_stats():
     session = load_session_data()
-    if session.get("is_locked", False):
-        return jsonify({
-            "is_locked": True,
-            "balance": 0.0,
-            "equity": 0.0,
-            "total_progress_drawdown": 0.0,
-            "current_pnl": 0.0,
-            "daily_profit": 0.0,
-            "open_trades": 0,
-            "remaining_trades": 0,
-            "overall_growth": 0.0
-        }), 200
-
+    is_locked = session.get("is_locked", False)
     latest_stats = session.get("latest_stats")
+
+    # إذا كان هناك بيانات مسجلة في الكاش، نرجعها فوراً مع تحديث حالة القفل الحالية عليها
     if latest_stats:
+        latest_stats["is_locked"] = is_locked
         return jsonify(latest_stats), 200
 
+    # في حال لم تتوفر قراءات مسبقة لأي سبب، نرجع الهيكل الافتراضي
     return jsonify({
-        "is_locked": False,
+        "is_locked": is_locked,
         "balance": 0.0,
         "equity": 0.0,
         "total_progress_drawdown": 0.0,
@@ -278,7 +273,6 @@ def get_account_stats():
     }), 200
 
 
-# ⚡ رابط الإغلاق الطارئ المطلوب من الفلوتر (تم ربطه بالكامل)
 @app.route('/api/emergency-close', methods=['POST'])
 def emergency_close():
     data = request.json or {}
@@ -290,12 +284,12 @@ def emergency_close():
         
     lockout_hours = int(data.get('lockout_hours', 2))
     
-    # حجز حالة القفل فوراً لمنع التكرار
     session["is_locked"] = True
     session["lock_until"] = (datetime.utcnow() + timedelta(hours=lockout_hours)).isoformat()
+    if session.get("latest_stats"):
+        session["latest_stats"]["is_locked"] = True
     save_session_data(session)
     
-    # تنفيذ مهمة الإغلاق الفعلي على خيط منفصل لتجنب تعليق الطلب
     def execute_closure():
         async def close_tasks():
             try:
@@ -307,13 +301,11 @@ def emergency_close():
                     await connection.connect()
                     await connection.wait_synchronized()
                     
-                    # إغلاق الصفقات
                     await close_all_account_positions(connection)
-                    await asyncio.sleep(3) # مهلة للبروكر
+                    await asyncio.sleep(3)
                     
-                    # فصل السيرفر تماماً
                     await account.undeploy()
-                    print("🔒 تم تفعيل الإغلاق العاجل وفصل الحساب من رابط الطوارئ.")
+                    print("🔒 تم تفعيل الإغلاق العاجل بنجاح مع الحفاظ على الكاش.")
             except Exception as ex:
                 print(f"❌ خطأ تنفيذ الطوارئ: {ex}")
                 
@@ -323,7 +315,6 @@ def emergency_close():
     return jsonify({"status": "success", "message": "تم استقبال أمر الطوارئ وجاري التنفيذ"})
 
 
-# ⚙️ رابط تحديث الإعدادات المطلوب من الفلوتر (تم ربطه بالكامل)
 @app.route('/api/update-targets', methods=['POST'])
 def update_targets():
     data = request.json or {}
