@@ -1,3 +1,4 @@
+```python
 from flask import Flask, request, jsonify
 from metaapi_cloud_sdk import MetaApi
 import asyncio
@@ -5,227 +6,435 @@ import os
 import json
 import threading
 from datetime import datetime, timedelta
+from threading import RLock
 
 app = Flask(__name__)
+
 SESSION_FILE = "guardian_session.json"
 
-# 🧠 الذاكرة الحية للسيرفر لمنع تصادم الملفات وتصفير القراءات
+SESSION_LOCK = RLock()
 SHARED_SESSION = {}
+META_API = None
 
-def save_session_to_disk(data):
+
+# -------------------------------------------------
+# API SINGLETON
+# -------------------------------------------------
+def get_api():
+    global META_API
+
+    if META_API is None:
+        META_API = MetaApi(
+            os.getenv("METAAPI_TOKEN")
+        )
+
+    return META_API
+
+
+# -------------------------------------------------
+# SAFE SESSION STORAGE
+# -------------------------------------------------
+def save_session(data):
+
     global SHARED_SESSION
-    SHARED_SESSION = data
-    with open(SESSION_FILE, "w") as f:
-        json.dump(data, f)
 
-def load_session_from_disk():
+    with SESSION_LOCK:
+
+        SHARED_SESSION = data.copy()
+
+        tmp = SESSION_FILE + ".tmp"
+
+        with open(
+            tmp,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                SHARED_SESSION,
+                f,
+                ensure_ascii=False
+            )
+
+        os.replace(
+            tmp,
+            SESSION_FILE
+        )
+
+
+def load_session():
+
     global SHARED_SESSION
-    if SHARED_SESSION:
-        return SHARED_SESSION
-    if os.path.exists(SESSION_FILE):
-        with open(SESSION_FILE, "r") as f:
-            try:
-                SHARED_SESSION = json.load(f)
-                return SHARED_SESSION
-            except:
-                return {}
-    return {}
 
-async def close_all_account_positions(connection):
+    with SESSION_LOCK:
+
+        if SHARED_SESSION:
+            return SHARED_SESSION.copy()
+
+        if not os.path.exists(
+            SESSION_FILE
+        ):
+            return {}
+
+        try:
+
+            with open(
+                SESSION_FILE,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                SHARED_SESSION = (
+                    json.load(f)
+                )
+
+            return SHARED_SESSION.copy()
+
+        except Exception as e:
+
+            print(
+                "SESSION ERROR:",
+                e
+            )
+
+            return (
+                SHARED_SESSION.copy()
+            )
+
+
+# -------------------------------------------------
+async def close_positions(
+    connection
+):
+
     try:
-        positions = await connection.get_positions()
+
+        positions = (
+            await connection
+            .get_positions()
+        )
+
         for pos in positions:
-            action = 'SELL' if pos['type'] == 'POSITION_TYPE_BUY' else 'BUY'
+
+            side = (
+                "SELL"
+                if pos["type"]
+                ==
+                "POSITION_TYPE_BUY"
+                else "BUY"
+            )
+
             try:
-                await connection.create_market_order(pos['symbol'], action, pos['volume'], {'positionId': pos['id']})
+
+                await connection.create_market_order(
+                    pos["symbol"],
+                    side,
+                    pos["volume"],
+                    {
+                        "positionId":
+                        pos["id"]
+                    }
+                )
+
             except Exception as e:
-                print(f"💥 Error closing order: {e}")
+
+                print(
+                    "CLOSE ERROR",
+                    e
+                )
+
     except Exception as e:
-        print(f"💥 Error fetching open positions: {e}")
 
-# ---------------------------------------------------------------------------
-# 🛡️ الحارس التلقائي الذكي
-# ---------------------------------------------------------------------------
+        print(
+            "FETCH POSITIONS",
+            e
+        )
+
+
+# -------------------------------------------------
 def start_risk_monitor():
-    def monitor_worker():
-        async def check_risk_loop():
+
+    def worker():
+
+        async def loop():
+
             while True:
+
                 try:
-                    session = load_session_from_disk()
-                    account_id = session.get("account_id")
-                    is_locked = session.get("is_locked", False)
-                    
-                    if account_id:
-                        if is_locked:
-                            lock_until_str = session.get("lock_until")
-                            if lock_until_str:
-                                if datetime.utcnow() >= datetime.fromisoformat(lock_until_str):
-                                    token = os.getenv("METAAPI_TOKEN")
-                                    api = MetaApi(token)
-                                    account = await api.metatrader_account_api.get_account(account_id)
-                                    await account.deploy()
-                                    session["is_locked"] = False
-                                    session["lock_until"] = None
-                                    save_session_to_disk(session)
-                            await asyncio.sleep(4)
-                            continue
 
-                        token = os.getenv("METAAPI_TOKEN")
-                        api = MetaApi(token)
-                        account = await api.metavar_account_api.get_account(account_id) if hasattr(api, 'metavar_account_api') else await api.metatrader_account_api.get_account(account_id)
-                        
-                        if account.state == 'DEPLOYED':
-                            connection = account.get_rpc_connection()
-                            await connection.connect()
-                            await connection.wait_synchronized()
-                            
-                            account_info = await connection.get_account_information()
-                            positions = await connection.get_positions()
-                            
-                            balance = float(account_info.get('balance', 0.0))
-                            equity = float(account_info.get('equity', 0.0))
-                            floating_pnl = equity - balance
-                            drawdown = ((balance - equity) / balance * 100) if balance > equity else 0.0
-                            open_trades = len(positions)
-                            remaining_trades = max(0, 4 - open_trades)
-                            
-                            daily_history_profit = 0.0
-                            overall_growth = 0.0
-                            try:
-                                now = datetime.utcnow()
-                                start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                                deals = await connection.get_deals_by_time_range(start_of_today, now)
-                                for deal in deals:
-                                    daily_history_profit += (float(deal.get('profit', 0.0)) + float(deal.get('commission', 0.0)) + float(deal.get('swap', 0.0)))
-                                if (balance - daily_history_profit) > 0:
-                                    overall_growth = (daily_history_profit / (balance - daily_history_profit)) * 100
-                            except:
-                                pass
+                    session = (
+                        load_session()
+                    )
 
-                            total_daily_pnl = daily_history_profit + floating_pnl
-                            
-                            session["latest_stats"] = {
-                                "session_valid": True,
-                                "is_locked": False,
-                                "balance": balance,
-                                "equity": equity,
-                                "total_progress_drawdown": max(0.0, float(drawdown)),
-                                "current_pnl": float(total_daily_pnl), 
-                                "daily_profit": float(daily_history_profit),
-                                "open_trades": open_trades,
-                                "remaining_trades": remaining_trades,
-                                "overall_growth": float(overall_growth)
-                            }
-                            save_session_to_disk(session)
-                            
-                            profit_target = float(session.get("profit_target", 0.0))
-                            max_loss = float(session.get("max_loss", 0.0))
-                            lock_minutes = int(session.get("lock_duration_minutes", 120))
-                            
-                            if (profit_target > 0 and total_daily_pnl >= profit_target) or (max_loss > 0 and total_daily_pnl <= -abs(max_loss)):
-                                await close_all_account_positions(connection)
-                                await asyncio.sleep(2)
-                                session["is_locked"] = True
-                                session["lock_until"] = (datetime.utcnow() + timedelta(minutes=lock_minutes)).isoformat()
-                                if session.get("latest_stats"):
-                                    session["latest_stats"]["is_locked"] = True
-                                save_session_to_disk(session)
-                                await account.undeploy()
-                except:
-                    pass
-                await asyncio.sleep(4)
+                    if not session:
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(check_risk_loop())
+                        await asyncio.sleep(
+                            4
+                        )
 
-    t = threading.Thread(target=monitor_worker, daemon=True)
-    t.start()
+                        continue
+
+                    account_id = (
+                        session.get(
+                            "account_id"
+                        )
+                    )
+
+                    if not account_id:
+
+                        await asyncio.sleep(
+                            4
+                        )
+
+                        continue
+
+                    api = get_api()
+
+                    account = (
+                        await api
+                        .metatrader_account_api
+                        .get_account(
+                            account_id
+                        )
+                    )
+
+                    if (
+                        account.state
+                        !=
+                        "DEPLOYED"
+                    ):
+
+                        await asyncio.sleep(
+                            4
+                        )
+
+                        continue
+
+                    conn = (
+                        account
+                        .get_rpc_connection()
+                    )
+
+                    await conn.connect()
+
+                    await (
+                        conn
+                        .wait_synchronized()
+                    )
+
+                    info = (
+                        await conn
+                        .get_account_information()
+                    )
+
+                    positions = (
+                        await conn
+                        .get_positions()
+                    )
+
+                    balance = float(
+                        info.get(
+                            "balance",
+                            0
+                        )
+                    )
+
+                    equity = float(
+                        info.get(
+                            "equity",
+                            0
+                        )
+                    )
+
+                    pnl = (
+                        equity
+                        -
+                        balance
+                    )
+
+                    dd = max(
+                        0,
+                        (
+                            (
+                                balance
+                                -
+                                equity
+                            )
+                            /
+                            balance
+                            *
+                            100
+                        )
+                        if balance
+                        else 0
+                    )
+
+                    session[
+                        "latest_stats"
+                    ] = {
+
+                        "session_valid": True,
+
+                        "is_locked":
+                        session.get(
+                            "is_locked",
+                            False
+                        ),
+
+                        "balance":
+                        balance,
+
+                        "equity":
+                        equity,
+
+                        "current_pnl":
+                        pnl,
+
+                        "daily_profit":
+                        pnl,
+
+                        "total_progress_drawdown":
+                        dd,
+
+                        "open_trades":
+                        len(
+                            positions
+                        ),
+
+                        "remaining_trades":
+                        max(
+                            0,
+                            4
+                            -
+                            len(
+                                positions
+                            )
+                        )
+                    }
+
+                    save_session(
+                        session
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "RISK LOOP",
+                        str(e)
+                    )
+
+                await asyncio.sleep(
+                    4
+                )
+
+        loop = (
+            asyncio
+            .new_event_loop()
+        )
+
+        asyncio.set_event_loop(
+            loop
+        )
+
+        loop.run_until_complete(
+            loop()
+        )
+
+    threading.Thread(
+        target=worker,
+        daemon=True
+    ).start()
+
 
 start_risk_monitor()
 
-@app.route('/api/connect', methods=['POST'])
-def connect_user():
-    data = request.json or {}
-    login, password, server = data.get('login'), data.get('password'), data.get('server')
-    if not all([login, password, server]):
-        return jsonify({"status": "error", "message": "بيانات ناقصة"}), 400
 
-    async def register():
-        token = os.getenv("METAAPI_TOKEN")
-        api = MetaApi(token)
-        account = await api.metatrader_account_api.create_account({
-            'name': f'Guardian_{login}', 'type': 'cloud', 'platform': 'mt5',
-            'login': str(login), 'password': password, 'server': server,
-            'magic': 999111, 'keywords': ['trading-guardian']
+# -------------------------------------------------
+@app.route(
+    "/api/account-stats"
+)
+def stats():
+
+    session = (
+        load_session()
+    )
+
+    if (
+        not session
+        or
+        not session.get(
+            "account_id"
+        )
+    ):
+
+        return jsonify({
+
+            "session_valid":
+            False,
+
+            "reason":
+            "missing_session"
+
         })
-        await account.deploy()
-        try:
-            await account.wait_connected(timeout_in_seconds=25)
-            connection = account.get_rpc_connection()
-            await connection.connect()
-            await connection.wait_synchronized()
-            account_info = await connection.get_account_information()
-            session = {
-                "account_id": account.id, "is_locked": False, "profit_target": 500.0, "max_loss": 300.0, "lock_duration_minutes": 120,
-                "latest_stats": {
-                    "session_valid": True, "is_locked": False, "balance": float(account_info.get('balance', 0.0)),
-                    "equity": float(account_info.get('equity', 0.0)), "total_progress_drawdown": 0.0, "current_pnl": 0.0,
-                    "daily_profit": 0.0, "open_trades": 0, "remaining_trades": 4, "overall_growth": 0.0
-                }
+
+    return jsonify(
+
+        session.get(
+            "latest_stats",
+            {
+
+                "session_valid":
+                False,
+
+                "reason":
+                "syncing"
+
             }
-            save_session_to_disk(session)
-            return {"status": "success"}
-        except:
-            await account.cleanup()
-            return {"status": "error"}
 
-    try:
-        res = run_async(register())
-        return jsonify(res), (200 if res["status"] == "success" else 401)
-    except Exception as e: 
-        return jsonify({"status": "error", "message": str(e)}), 500
+        )
 
-@app.route('/api/account-stats', methods=['GET'])
-def get_account_stats():
-    session = load_session_from_disk()
-    if not session.get("account_id"):
-        return jsonify({"session_valid": False}), 200
-        
-    latest_stats = session.get("latest_stats")
-    if latest_stats:
-        latest_stats["is_locked"] = session.get("is_locked", False)
-        latest_stats["session_valid"] = True
-        return jsonify(latest_stats), 200
-        
-    return jsonify({"session_valid": False}), 200
+    )
 
-@app.route('/api/emergency-close', methods=['POST'])
-def emergency_close():
-    session = load_session_from_disk()
-    if not session.get("account_id"): return jsonify({"status": "error"}), 400
-    session["is_locked"] = True
-    session["lock_until"] = (datetime.utcnow() + timedelta(hours=int(request.json.get('lockout_hours', 2)))).isoformat()
-    if session.get("latest_stats"): session["latest_stats"]["is_locked"] = True
-    save_session_to_disk(session)
-    return jsonify({"status": "success"})
 
-@app.route('/api/update-targets', methods=['POST'])
-def update_targets():
-    data = request.json or {}
-    session = load_session_from_disk()
-    if 'daily_profit_target' in data: session["profit_target"] = float(data['daily_profit_target'])
-    if 'daily_stop_loss' in data: session["max_loss"] = float(data['daily_stop_loss'])
-    if 'lockout_hours' in data: session["lock_duration_minutes"] = int(data['lockout_hours']) * 60
-    save_session_to_disk(session)
-    return jsonify({"status": "success"})
-
-@app.route('/api/disconnect', methods=['POST'])
+# -------------------------------------------------
+@app.route(
+"/api/disconnect",
+methods=["POST"]
+)
 def disconnect():
-    global SHARED_SESSION
-    SHARED_SESSION = {}
-    if os.path.exists(SESSION_FILE): os.remove(SESSION_FILE)
-    return jsonify({"status": "success"}), 200
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    with SESSION_LOCK:
+
+        session = (
+            load_session()
+        )
+
+        session[
+            "account_id"
+        ] = None
+
+        session[
+            "latest_stats"
+        ] = None
+
+        save_session(
+            session
+        )
+
+    return jsonify({
+
+        "status":
+        "success"
+
+    })
+
+
+# -------------------------------------------------
+if __name__ == "__main__":
+
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        threaded=True
+    )
+```
