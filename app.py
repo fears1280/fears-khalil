@@ -31,8 +31,28 @@ def load_session_data():
                 return {}
     return {}
 
+# 🛡️ دالة مساعدة لإغلاق كافة الصفقات بشكل صحيح عبر أوامر عكسية في MetaApi
+async def close_all_account_positions(connection):
+    try:
+        positions = await connection.get_positions()
+        print(f"📦 جاري إغلاق صفقات نشطة عددها: {len(positions)}")
+        for pos in positions:
+            action = 'SELL' if pos['type'] == 'POSITION_TYPE_BUY' else 'BUY'
+            try:
+                await connection.create_market_order(
+                    pos['symbol'], 
+                    action, 
+                    pos['volume'], 
+                    {'positionId': pos['id']}
+                )
+                print(f"✅ تم إغلاق الصفقة رقم: {pos['id']}")
+            except Exception as order_err:
+                print(f"❌ خطأ في إغلاق الصفقة {pos['id']}: {order_err}")
+    except Exception as e:
+        print(f"❌ خطأ أثناء جلب الصفقات للإغلاق: {e}")
+
 # ---------------------------------------------------------------------------
-# 🔐 الحارس الخلفي: معزول ومحمي بالكامل لضمان عدم اختفاء القراءة أبداً
+# 🔐 الحارس الخلفي للمراقبة التلقائية
 # ---------------------------------------------------------------------------
 def start_risk_monitor():
     def monitor_worker():
@@ -49,7 +69,7 @@ def start_risk_monitor():
                             if lock_until_str:
                                 lock_until = datetime.fromisoformat(lock_until_str)
                                 if datetime.utcnow() >= lock_until:
-                                    print("🔓 انتهت مدة القفل! إعادة تفعيل حساب الميتا...")
+                                    print("🔓 انتهت مدة القفل التلقائي! إعادة التفعيل...")
                                     token = os.getenv("METAAPI_TOKEN")
                                     api = MetaApi(token)
                                     account = await api.metatrader_account_api.get_account(account_id)
@@ -70,7 +90,6 @@ def start_risk_monitor():
                             await connection.connect()
                             await connection.wait_synchronized()
                             
-                            # 📈 1. جلب البيانات الأساسية (مضمونة ولا تتأثر بالهيستوري)
                             account_info = await connection.get_account_information()
                             positions = await connection.get_positions()
                             
@@ -82,16 +101,13 @@ def start_risk_monitor():
                             open_trades = len(positions)
                             remaining_trades = max(0, 4 - open_trades)
                             
-                            # قيم افتراضية أولية للهيستوري والنمو لضمان عدم حدوث كراش
                             daily_history_profit = 0.0
                             overall_growth = 0.0
                             
-                            # 📊 2. جلب الهيستوري والنمو اليومي (داخل بلوك معزول وآمن تماماً)
                             try:
                                 now = datetime.utcnow()
                                 start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
                                 deals = await connection.get_deals_by_time_range(start_of_today, now)
-                                
                                 if deals:
                                     for deal in deals:
                                         profit = float(deal.get('profit', 0.0))
@@ -99,37 +115,31 @@ def start_risk_monitor():
                                         swap = float(deal.get('swap', 0.0))
                                         daily_history_profit += (profit + commission + swap)
                                     
-                                    # احتساب الرصيد الابتدائي لليوم بناءً على الهيستوري المغلق
                                     starting_balance = balance - daily_history_profit
                                     if starting_balance > 0:
                                         overall_growth = (daily_history_profit / starting_balance) * 100
                             except Exception as history_error:
-                                # في حال فشل الهيستوري لأي سبب، نطبخ القيم الافتراضية ولا نجعل السيرفر يعلق
-                                print(f"⚠️ تنبيه: تعذر جلب الهيستوري اليومي حالياً: {history_error}")
-                                daily_history_profit = 0.0
-                                overall_growth = 0.0
+                                print(f"⚠️ فشل جلب الهيستوري: {history_error}")
 
-                            # المجموع الإجمالي الفعلي لحماية الحساب (الهيستوري المغلق + العائم المفتوح)
                             total_daily_pnl = daily_history_profit + floating_pnl
                             
-                            # 🎯 3. تحديث الكاش فوراً (البيانات ستصل للفلوتر رغماً عن أي خطأ)
+                            # تحديث الكاش مع مطابقة اسم مفتاح التراجع مع الفلوتر (total_progress_drawdown)
                             session["latest_stats"] = {
                                 "is_locked": False,
                                 "balance": balance,
                                 "equity": equity,
-                                "drawdown_percent": max(0.0, float(drawdown)),
+                                "total_progress_drawdown": max(0.0, float(drawdown)),
                                 "current_pnl": float(floating_pnl),
-                                "daily_profit": float(daily_history_profit), 
+                                "daily_profit": float(daily_history_profit),
                                 "open_trades": open_trades,
                                 "remaining_trades": remaining_trades,
                                 "overall_growth": float(overall_growth)
                             }
                             save_session_data(session)
                             
-                            # 🛡️ 4. فحص حماية الحساب والمخاطر
                             profit_target = float(session.get("profit_target", 0.0))
                             max_loss = float(session.get("max_loss", 0.0))
-                            lock_minutes = int(session.get("lock_duration_minutes", 60))
+                            lock_minutes = int(session.get("lock_duration_minutes", 120))
                             
                             trigger_lock = False
                             if profit_target > 0 and total_daily_pnl >= profit_target:
@@ -138,25 +148,18 @@ def start_risk_monitor():
                                 trigger_lock = True
                             
                             if trigger_lock:
-                                await connection.close_all_positions()
-                                lock_until_time = datetime.utcnow() + timedelta(minutes=lock_minutes)
+                                print("🛑 تم رصد اختراق الأهداف من الحارس التلقائي! جاري التصفية...")
+                                await close_all_account_positions(connection)
+                                await asyncio.sleep(3) # مهلة تأكيد الإغلاق في السيرفر قبل الـ undeploy
                                 
+                                lock_until_time = datetime.utcnow() + timedelta(minutes=lock_minutes)
                                 session["is_locked"] = True
                                 session["lock_until"] = lock_until_time.isoformat()
-                                session["latest_stats"] = {
-                                    "is_locked": True,
-                                    "balance": balance,
-                                    "equity": balance,
-                                    "drawdown_percent": 0.0,
-                                    "current_pnl": 0.0,
-                                    "daily_profit": float(daily_history_profit),
-                                    "open_trades": 0,
-                                    "remaining_trades": 0,
-                                    "overall_growth": float(overall_growth)
-                                }
+                                session["latest_stats"]["is_locked"] = True
                                 save_session_data(session)
+                                
                                 await account.undeploy()
-                                print(f"🔒 تم قفل وتأمين الحساب بنجاح.")
+                                print(f"🔒 تم قفل الحساب بنجاح.")
                                 
                 except Exception as e:
                     print(f"❌ خطأ الحارس العام: {e}")
@@ -172,7 +175,7 @@ def start_risk_monitor():
 start_risk_monitor()
 
 # ---------------------------------------------------------------------------
-# 🚀 الروابط الثابتة والآمنة
+# 🚀 الروابط البرمجية (Endpoints) متوافقة 100% مع الفلوتر
 # ---------------------------------------------------------------------------
 
 @app.route('/api/connect', methods=['POST'])
@@ -211,14 +214,14 @@ def connect_user():
             session = {
                 "account_id": account.id,
                 "is_locked": False,
-                "profit_target": 0.0,
-                "max_loss": 0.0,
-                "lock_duration_minutes": 60,
+                "profit_target": 500.0,
+                "max_loss": 300.0,
+                "lock_duration_minutes": 120,
                 "latest_stats": {
                     "is_locked": False,
                     "balance": float(account_info.get('balance', 0.0)),
                     "equity": float(account_info.get('equity', 0.0)),
-                    "drawdown_percent": 0.0,
+                    "total_progress_drawdown": 0.0,
                     "current_pnl": 0.0,
                     "daily_profit": 0.0,
                     "open_trades": 0,
@@ -230,7 +233,7 @@ def connect_user():
             return {"status": "success", "accountId": account.id}
         except Exception as conn_error:
             await account.cleanup()
-            return {"status": "error", "message": "فشل الاتصال بالبروكر الحقيقي"}
+            return {"status": "error", "message": "فشل الاتصال بالبروكر"}
 
     try:
         result = run_async(register_and_validate())
@@ -250,7 +253,7 @@ def get_account_stats():
             "is_locked": True,
             "balance": 0.0,
             "equity": 0.0,
-            "drawdown_percent": 0.0,
+            "total_progress_drawdown": 0.0,
             "current_pnl": 0.0,
             "daily_profit": 0.0,
             "open_trades": 0,
@@ -266,7 +269,7 @@ def get_account_stats():
         "is_locked": False,
         "balance": 0.0,
         "equity": 0.0,
-        "drawdown_percent": 0.0,
+        "total_progress_drawdown": 0.0,
         "current_pnl": 0.0,
         "daily_profit": 0.0,
         "open_trades": 0,
@@ -275,18 +278,68 @@ def get_account_stats():
     }), 200
 
 
-@app.route('/api/set-targets', methods=['POST'])
-def set_targets():
+# ⚡ رابط الإغلاق الطارئ المطلوب من الفلوتر (تم ربطه بالكامل)
+@app.route('/api/emergency-close', methods=['POST'])
+def emergency_close():
+    data = request.json or {}
+    session = load_session_data()
+    account_id = session.get("account_id")
+    
+    if not account_id:
+        return jsonify({"status": "error", "message": "لا يوجد حساب نشط"}), 400
+        
+    lockout_hours = int(data.get('lockout_hours', 2))
+    
+    # حجز حالة القفل فوراً لمنع التكرار
+    session["is_locked"] = True
+    session["lock_until"] = (datetime.utcnow() + timedelta(hours=lockout_hours)).isoformat()
+    save_session_data(session)
+    
+    # تنفيذ مهمة الإغلاق الفعلي على خيط منفصل لتجنب تعليق الطلب
+    def execute_closure():
+        async def close_tasks():
+            try:
+                token = os.getenv("METAAPI_TOKEN")
+                api = MetaApi(token)
+                account = await api.metatrader_account_api.get_account(account_id)
+                if account.state == 'DEPLOYED':
+                    connection = account.get_rpc_connection()
+                    await connection.connect()
+                    await connection.wait_synchronized()
+                    
+                    # إغلاق الصفقات
+                    await close_all_account_positions(connection)
+                    await asyncio.sleep(3) # مهلة للبروكر
+                    
+                    # فصل السيرفر تماماً
+                    await account.undeploy()
+                    print("🔒 تم تفعيل الإغلاق العاجل وفصل الحساب من رابط الطوارئ.")
+            except Exception as ex:
+                print(f"❌ خطأ تنفيذ الطوارئ: {ex}")
+                
+        run_async(close_tasks())
+
+    threading.Thread(target=execute_closure, daemon=True).start()
+    return jsonify({"status": "success", "message": "تم استقبال أمر الطوارئ وجاري التنفيذ"})
+
+
+# ⚙️ رابط تحديث الإعدادات المطلوب من الفلوتر (تم ربطه بالكامل)
+@app.route('/api/update-targets', methods=['POST'])
+def update_targets():
     data = request.json or {}
     session = load_session_data()
     if not session.get("account_id"):
         return jsonify({"status": "error", "message": "لا يوجد حساب نشط"}), 400
         
-    session["profit_target"] = float(data.get('profit_target', 0.0))
-    session["max_loss"] = float(data.get('max_loss', 0.0))
-    session["lock_duration_minutes"] = int(data.get('lock_duration_minutes', 60))
+    if 'daily_profit_target' in data:
+        session["profit_target"] = float(data['daily_profit_target'])
+    if 'daily_stop_loss' in data:
+        session["max_loss"] = float(data['daily_stop_loss'])
+    if 'lockout_hours' in data:
+        session["lock_duration_minutes"] = int(data['lockout_hours']) * 60
+        
     save_session_data(session)
-    return jsonify({"status": "success", "message": "تم تحديث الأهداف بنجاح"})
+    return jsonify({"status": "success", "message": "تم تحديث الإعدادات والأهداف بنجاح"})
 
 
 @app.route('/api/disconnect', methods=['POST'])
