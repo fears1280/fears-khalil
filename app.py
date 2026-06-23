@@ -32,7 +32,7 @@ def load_session_data():
     return {}
 
 # ---------------------------------------------------------------------------
-# 🔐 الحارس الخلفي: يتصل بـ MetaApi، يحدّث الكاش الفعلي، ويفحص الأهداف
+# 🔐 الحارس الخلفي: يتصل بـ MetaApi، يقرأ الهيستوري اليومي، ويحدث الكاش
 # ---------------------------------------------------------------------------
 def start_risk_monitor():
     def monitor_worker():
@@ -44,7 +44,6 @@ def start_risk_monitor():
                     is_locked = session.get("is_locked", False)
                     
                     if account_id:
-                        # 1. التحقق من انتهاء مدة القفل
                         if is_locked:
                             lock_until_str = session.get("lock_until")
                             if lock_until_str:
@@ -62,7 +61,6 @@ def start_risk_monitor():
                             await asyncio.sleep(4)
                             continue
 
-                        # 2. جلب البيانات الحقيقية من MetaApi وتحديث الكاش
                         token = os.getenv("METAAPI_TOKEN")
                         api = MetaApi(token)
                         account = await api.metatrader_account_api.get_account(account_id)
@@ -75,39 +73,65 @@ def start_risk_monitor():
                             account_info = await connection.get_account_information()
                             positions = await connection.get_positions()
                             
+                            # 📊 1. جلب الهيستوري اليومي (منذ بداية اليوم الحالي 00:00 UTC)
+                            now = datetime.utcnow()
+                            start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                            deals = await connection.get_deals_by_time_range(start_of_today, now)
+                            
+                            # حساب صافي الأرباح المغلقة من الهيستوري اليومي تشمل الكوميشن والسواب
+                            daily_history_profit = 0.0
+                            for deal in deals:
+                                # نتأكد أن الصفقة لها تأثير مالي (ربح/خسارة، عمولة، سواب)
+                                profit = float(deal.get('profit', 0.0))
+                                commission = float(deal.get('commission', 0.0))
+                                swap = float(deal.get('swap', 0.0))
+                                daily_history_profit += (profit + commission + swap)
+                            
+                            # 📈 2. الحسابات والمؤشرات الحية
                             balance = float(account_info.get('balance', 0.0))
                             equity = float(account_info.get('equity', 0.0))
-                            current_pnl = equity - balance
+                            floating_pnl = equity - balance # الأرباح العائمة حالياً للي بربح وخسر بالصفقات المفتوحة
                             
-                            # حساب التراجع المئوي الحي بدقة
-                            drawdown = ((balance - equity) / balance * 100) if balance > 0 else 0.0
+                            # حساب الرصيد الابتدائي لليوم بناءً على الهيستوري
+                            starting_balance = balance - daily_history_profit
+                            
+                            # التقدم الإجمالي اليومي بالنسبة المئوية
+                            overall_growth = (daily_history_profit / starting_balance * 100) if starting_balance > 0 else 0.0
+                            
+                            # حساب التراجع الحالي (Drawdown)
+                            drawdown = ((balance - equity) / balance * 100) if balance > equity else 0.0
                             open_trades = len(positions)
                             remaining_trades = max(0, 4 - open_trades)
                             
-                            # تحديث الكاش بالبيانات الصحيحة التي ينتظرها الفلوتر
+                            # 🎯 المجموع الإجمالي لأرباح وخسائر اليوم (المغلق + العائم حالياً) لحماية الحساب بدقة
+                            total_daily_pnl = daily_history_profit + floating_pnl
+                            
+                            # تحديث الكاش للفلوتر
                             session["latest_stats"] = {
                                 "is_locked": False,
                                 "balance": balance,
                                 "equity": equity,
                                 "drawdown_percent": max(0.0, float(drawdown)),
-                                "current_pnl": float(current_pnl),
-                                "daily_profit": float(current_pnl), # تحديث قيمة الربح اليومي العائم
+                                "current_pnl": float(floating_pnl),       # صفقات مفتوحة حالياً
+                                "daily_profit": float(daily_history_profit), # صفقات مغلقة من الهيستوري
                                 "open_trades": open_trades,
                                 "remaining_trades": remaining_trades,
-                                "overall_growth": ((equity - balance) / balance * 100) if balance > 0 else 0.0
+                                "overall_growth": float(overall_growth)    # نسبة النمو اليومي من الهيستوري
                             }
                             save_session_data(session)
                             
-                            # فحص الأهداف المحددة من المستخدم
+                            # 🛡️ 3. فحص الأهداف بناء على إجمالي اليوم (مغلق + عائم)
                             profit_target = float(session.get("profit_target", 0.0))
                             max_loss = float(session.get("max_loss", 0.0))
                             lock_minutes = int(session.get("lock_duration_minutes", 60))
                             
                             trigger_lock = False
-                            if profit_target > 0 and current_pnl >= profit_target:
+                            if profit_target > 0 and total_daily_pnl >= profit_target:
                                 trigger_lock = True
-                            if max_loss > 0 and current_pnl <= -abs(max_loss):
+                                print(f"🎯 تحقق هدف أرباح اليوم (مغلق+عائم): {total_daily_pnl}$")
+                            if max_loss > 0 and total_daily_pnl <= -abs(max_loss):
                                 trigger_lock = True
+                                print(f"🛑 تحقق حد خسارة اليوم (مغلق+عائم): {total_daily_pnl}$")
                             
                             if trigger_lock:
                                 await connection.close_all_positions()
@@ -121,13 +145,14 @@ def start_risk_monitor():
                                     "equity": balance,
                                     "drawdown_percent": 0.0,
                                     "current_pnl": 0.0,
-                                    "daily_profit": 0.0,
+                                    "daily_profit": float(daily_history_profit),
                                     "open_trades": 0,
                                     "remaining_trades": 0,
-                                    "overall_growth": 0.0
+                                    "overall_growth": float(overall_growth)
                                 }
                                 save_session_data(session)
-                                await account.undeploy() # فصل الحساب تماماً وإغلاق الميتا
+                                await account.undeploy()
+                                print(f"🔒 تم قفل الحساب وفصله بنجاح.")
                                 
                 except Exception as e:
                     print(f"❌ خطأ الحارس: {e}")
@@ -143,12 +168,11 @@ def start_risk_monitor():
 start_risk_monitor()
 
 # ---------------------------------------------------------------------------
-# 🚀 الروابط (Endpoints) الصارمة والآمنة
+# 🚀 الروابط (Endpoints)
 # ---------------------------------------------------------------------------
 
 @app.route('/api/connect', methods=['POST'])
 def connect_user():
-    """ 🔒 فحص حقيقي صارم للبيانات قبل السماح بالدخول """
     data = request.json or {}
     login = data.get('login')
     password = data.get('password')
@@ -161,8 +185,6 @@ def connect_user():
     async def register_and_validate():
         token = os.getenv("METAAPI_TOKEN")
         api = MetaApi(token)
-        
-        # 1. إنشاء الحساب على سيرفر MetaApi
         account = await api.metatrader_account_api.create_account({
             'name': f'Guardian_{login}',
             'type': 'cloud',
@@ -173,19 +195,15 @@ def connect_user():
             'magic': 999111,
             'keywords': ['trading-guardian']
         })
-        
         await account.deploy()
         
-        # 2. ⚠️ اختبار الاتصال الفعلي بالبروكر للتحقق من كلمة السر والرقم
         try:
             await account.wait_connected(timeout_in_seconds=30)
             connection = account.get_rpc_connection()
             await connection.connect()
             await connection.wait_synchronized()
-            # جلب أول قراءة للتأكد من نجاح المصادقة بالكامل
             account_info = await connection.get_account_information()
             
-            # مسح البيانات القديمة تماماً وبدء جلسة نظيفة بحساب حقيقي
             session = {
                 "account_id": account.id,
                 "is_locked": False,
@@ -206,18 +224,16 @@ def connect_user():
             }
             save_session_data(session)
             return {"status": "success", "accountId": account.id}
-            
         except Exception as conn_error:
-            # 🛑 إذا كانت البيانات وهمية أو خاطئة، نقوم بحذف الحساب فوراً وإرجاع خطأ
             await account.cleanup()
-            return {"status": "error", "message": "فشل الاتصال بالبروكر. تأكد من رقم الحساب، كلمة المرور، أو السيرفر الحقيقي."}
+            return {"status": "error", "message": "فشل الاتصال بالبروكر الحقيقي"}
 
     try:
         result = run_async(register_and_validate())
         if result["status"] == "success":
             return jsonify(result), 200
         else:
-            return jsonify(result), 401 # كود 401 يمنع الفلوتر من الدخول نهائياً
+            return jsonify(result), 401
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -225,7 +241,6 @@ def connect_user():
 @app.route('/api/account-stats', methods=['GET'])
 def get_account_stats():
     session = load_session_data()
-    
     if session.get("is_locked", False):
         return jsonify({
             "is_locked": True,
