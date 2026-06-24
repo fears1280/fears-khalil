@@ -42,7 +42,6 @@ def connect():
     password = data.get('password')
     server = data.get('server')
     
-    # تأمين تحويل قيم الأهداف القادمة من فلاتر
     try:
         daily_target = float(data.get('daily_target', 500.0))
         max_loss_limit = -abs(float(data.get('max_loss_limit', 500.0)))
@@ -61,7 +60,6 @@ def connect():
             api = MetaApi(API_TOKEN)
             account = None
             
-            # محاولة الفحص الذكي عن الحساب لتجنب مشكلة الـ Limit في الحساب المجاني
             try:
                 print("🔄 Checking existing accounts on MetaApi...")
                 existing_accounts = await api.metatrader_account_api.get_accounts()
@@ -84,7 +82,6 @@ def connect():
             except Exception as check_error:
                 print(f"⚠️ Safe bypass: Quick check failed ({check_error}), proceeding to registration.")
             
-            # إذا لم نجد الحساب مضافاً مسبقاً، نقوم بإنشائه فوراً
             if not account:
                 print(f"✨ Creating new MetaApi account for login: {login}")
                 account = await api.metatrader_account_api.create_account({
@@ -98,7 +95,6 @@ def connect():
                     'keywords': ['trading-guardian']
                 })
             
-            # استخراج حالة الحساب ورقم الـ ID بمرونة
             try:
                 account_state = account.state if hasattr(account, 'state') else account.get('state', '')
                 account_id = account.id if hasattr(account, 'id') else account.get('id')
@@ -119,7 +115,6 @@ def connect():
             account_info = await connection.get_account_information()
             initial_balance = float(account_info.get('balance', 0.0))
             
-            # إنشاء معرف جلسة فريد ومحمي
             session_id = f"session_{login}_{int(time.time())}"
             session_data = {
                 'session_id': session_id,
@@ -158,7 +153,7 @@ def connect():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ---------------------------------------------------------------------------
-# 2. دالة جلب الإحصائيات الحية ومراقبة الحساب (Account Stats & Monitor)
+# 2. دالة جلب الإحصائيات الحية ومراقبة الحساب النشط (منع التداول الحامي الحقيقي)
 # ---------------------------------------------------------------------------
 @app.route('/api/account-stats', methods=['GET'])
 def account_stats():
@@ -169,7 +164,7 @@ def account_stats():
         
     session = sessions.get(session_id)
     
-    # 🌟 طوق النجاة: إعادة بناء الجلسة تلقائياً إذا حصل ريستارت للسيرفر والحساب متصل في ميتاترايدر
+    # استرداد الجلسة تلقائياً في حالة الريستارت لمنع الأصفار
     if not session:
         print(f"⚠️ Session {session_id} missing from RAM. Starting auto-recovery...")
         try:
@@ -193,7 +188,9 @@ def account_stats():
                             'daily_target': 500.0,
                             'max_loss_limit': -500.0,
                             'daily_profit': 0.0,
-                            'daily_loss': 0.0
+                            'daily_loss': 0.0,
+                            'balance': 0.0,
+                            'equity': 0.0
                         }
                         sessions[session_id] = session_data
                         session = session_data
@@ -202,12 +199,8 @@ def account_stats():
         except Exception as recovery_error:
             print(f"❌ Recovery failed: {recovery_error}")
 
-    # إذا فُقدت تماماً ولم يتم العثور عليها بالمنصة
     if not session:
         return jsonify({"status": "error", "message": "خطأ في المصادقة: الجلسة منتهية، يرجى إعادة الدخول"}), 401
-
-    if session.get('is_locked'):
-        return jsonify({"status": "locked", "message": "الحساب مقفل حالياً بحارس التداول"}), 200
 
     try:
         async def fetch_stats():
@@ -228,19 +221,31 @@ def account_stats():
             equity = float(account_info.get('equity', 0.0))
             pnl = equity - balance
             
-            # حساب الأرقام الإحصائية والتراجع ونسبة النمو الإجمالية
             initial = float(session.get('initial_balance', balance))
             drawdown_percent = abs((pnl / balance) * 100) if pnl < 0 else 0.0
             overall_growth = ((balance - initial) / initial) * 100 if initial > 0 else 0.0
             
-            # تحديث بيانات الجلسة الحالية في الذاكرة
             session['balance'] = balance
             session['equity'] = equity
+            
+            # 🔥🔥 هنا السحر: إذا كان الحساب مغلقاً بسبب تخطي الأهداف وقام المستخدم بفتح صفقة جديدة عمداً
+            if session.get('is_locked') and len(positions) > 0:
+                print(f"🚨 User tried to trade during Lockout! Closing {len(positions)} unauthorized positions.")
+                for pos in positions:
+                    try:
+                        await connection.cancel_order(pos['id'])
+                    except:
+                        try:
+                            await connection.close_position(pos['id'])
+                        except:
+                            pass
+                # تصفير عدد الصفقات في الاستجابة لأننا أغلقناها فوراً
+                positions = []
             
             return {
                 "status": "success",
                 "data": {
-                    "is_locked": False,
+                    "is_locked": session.get('is_locked', False), # نرسل حالة القفل الصحيحة دون تصفير الواجهة
                     "balance": balance,
                     "equity": equity,
                     "current_pnl": pnl,
@@ -256,11 +261,10 @@ def account_stats():
 
     except Exception as e:
         print(f"Stats API Error: {e}")
-        # حماية ضد السقوط: إرجاع آخر بيانات محفوظة للجلسة بدلاً من الانهيار الكلي بـ 500
         return jsonify({
             "status": "success",
             "data": {
-                "is_locked": False,
+                "is_locked": session.get('is_locked', False),
                 "balance": session.get('balance', 0.0),
                 "equity": session.get('equity', 0.0),
                 "current_pnl": 0.0,
@@ -287,14 +291,13 @@ def update_targets():
     if 'daily_profit_target' in data:
         session['daily_target'] = float(data['daily_profit_target'])
     if 'daily_stop_loss' in data:
-        # تأكيد حفظ حد الخسارة كقيمة سالبة في بايثون دوماً
         session['max_loss_limit'] = -abs(float(data['daily_stop_loss']))
         
     print(f"⚙️ Targets updated for session {session_id}: Target={session['daily_target']}, LossLimit={session['max_loss_limit']}")
     return jsonify({"status": "success", "message": "تم تحديث الأهداف بنجاح"}), 200
 
 # ---------------------------------------------------------------------------
-# 4. دالة الإغلاق الطارئ وقفل الحساب (Emergency Close)
+# 4. دالة الإغلاق الطارئ الذكية (تغلق الصفقات وتفعل القفل دون حذف البيانات)
 # ---------------------------------------------------------------------------
 @app.route('/api/emergency-close', methods=['POST'])
 def emergency_close():
@@ -306,6 +309,8 @@ def emergency_close():
         return jsonify({"status": "error", "message": "جلسة عمل غير صالحة"}), 401
         
     session = sessions[session_id]
+    
+    # تفعيل علامة القفل الداخلي مع بقاء الاتصال لقراءة البيانات
     session['is_locked'] = True
     
     try:
@@ -316,23 +321,20 @@ def emergency_close():
             await connection.connect()
             await connection.wait_synchronized()
             
-            # جلب وإغلاق كل الصفقات المفتوحة فوراً لحماية الحساب
             positions = await connection.get_positions()
-            print(f"🚨 Emergency Close triggered for Login {session['login']}. Closing {len(positions)} positions. Reason: {reason}")
+            print(f"🚨 Target Reached for Login {session['login']}. Closing {len(positions)} positions. Reason: {reason}")
             
             for pos in positions:
                 try:
                     await connection.cancel_order(pos['id'])
                 except:
                     try:
-                        # محاولة الإغلاق المباشر بحسب هيكلية الحزمة
                         await connection.close_position(pos['id'])
                     except Exception as close_err:
                         print(f"Could not close position {pos['id']}: {close_err}")
             
-            # عمل Undeploy للحساب لمنع أي تداول يدوي من الـ PC أو الهاتف لفترة الحظر
-            await account.undeploy()
-            return {"status": "success", "message": f"تم تفعيل الحظر الطارئ بنجاح وإغلاق الصفقات. السبب: {reason}"}
+            # 🌟 تم إلغاء سطر الـ undeploy() لضمان استمرار قراءة الرصيد بنجاح دون أصفار!
+            return {"status": "success", "message": f"تم تفعيل القفل بنجاح، رصيدك آمن ولن تتمكن من التداول حتى انتهاء المدة. السبب: {reason}"}
             
         result = run_async(close_all_positions())
         return jsonify(result), 200
@@ -358,6 +360,5 @@ def disconnect():
 # تشغيل السيرفر
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    # العمل على البورت الديناميكي لـ Render أو 5000 محلياً
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
