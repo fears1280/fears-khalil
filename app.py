@@ -1,15 +1,23 @@
 import os
 import asyncio
 import threading
+import time
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
-from metaapi_cloud_sdk import MetaApi
 
 app = Flask(__name__)
 CORS(app)
-# إعداد الـ SocketIO لدعم الاتصال الحي المستمر
-socketio = SocketIO(app, cors_allowed_origins="*")
+
+# التعديل الذهبي لضمان استقرار البث الحي على سيرفرات Render ومنع خروج الكود بـ status 1
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    async_mode='threading', # يمنع تعارض الـ Async Loops
+    ping_timeout=60, 
+    ping_interval=25
+)
 
 API_TOKEN = os.environ.get('METAAPI_TOKEN', '')
 sessions = {}
