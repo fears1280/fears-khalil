@@ -35,8 +35,11 @@ def load_sessions():
 
 def save_sessions():
     with SESSION_LOCK:
-        with open(SESSIONS_FILE, 'w') as f:
-            json.dump(SHARED_SESSION, f, indent=2)
+        try:
+            with open(SESSIONS_FILE, 'w') as f:
+                json.dump(SHARED_SESSION, f, indent=2)
+        except Exception as e:
+            print(f"Error saving sessions to disk: {e}")
 
 def get_session(session_id):
     return SHARED_SESSION.get(session_id, None)
@@ -64,7 +67,7 @@ class RiskMonitor(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.running = True
-        self.check_interval = 4
+        self.check_interval = 5
         
     def run(self):
         print("Risk Monitor started...")
@@ -81,7 +84,7 @@ class RiskMonitor(threading.Thread):
             sessions = list(SHARED_SESSION.items())
             
         for session_id, session_data in sessions:
-            if session_data.get('status') != 'connected':
+            if session_data.get('status') != 'connected' or session_data.get('is_locked'):
                 continue
                 
             daily_loss = session_data.get('daily_loss', 0)
@@ -90,11 +93,11 @@ class RiskMonitor(threading.Thread):
             daily_target = session_data.get('daily_target', 500)
             
             if daily_loss <= max_loss_limit:
-                print(f"Max loss reached for {session_id}")
+                print(f"🚨 Max loss reached for {session_id}")
                 self.emergency_lockdown(session_id, "reached_max_loss")
                 
             elif daily_profit >= daily_target:
-                print(f"Daily target reached for {session_id}")
+                print(f"🎯 Daily target reached for {session_id}")
                 self.emergency_lockdown(session_id, "reached_daily_target")
                     
     def emergency_lockdown(self, session_id, reason):
@@ -112,10 +115,19 @@ class RiskMonitor(threading.Thread):
             session['lockdown_reason'] = reason
             
             update_session(session_id, session)
-            print(f"Account {session_id} locked: {reason}")
+            print(f"🔒 Account {session_id} locked successfully. Reason: {reason}")
             
+            # اختياري: عمل undeploy للحساب لفصله تماماً سحابياً ومنع الدخول العشوائي
+            async def stop_acc():
+                acc = await api.metatrader_account_api.get_account(account_id)
+                await acc.undeploy()
+            try:
+                run_async(stop_acc())
+            except:
+                pass
+                
         except Exception as e:
-            print(f"Lockdown error: {e}")
+            print(f"Lockdown error for session {session_id}: {e}")
             
     async def close_all_positions(self, account_id):
         try:
@@ -123,24 +135,38 @@ class RiskMonitor(threading.Thread):
             if account.state != 'DEPLOYED':
                 await account.deploy()
             
-            positions = await account.get_positions()
-            for position in positions:
-                await account.close_position_by_symbol(position.symbol)
-                
-            print(f"Closed all positions for {account_id}")
+            # 🔌 الربط الصحيح عبر الـ RPC Connection لجلب وإغلاق الصفقات
+            connection = account.get_rpc_connection()
+            await connection.connect()
+            await connection.wait_synchronized()
+            
+            positions = await connection.get_positions()
+            for pos in positions:
+                action = 'SELL' if pos['type'] == 'POSITION_TYPE_BUY' else 'BUY'
+                try:
+                    await connection.create_market_order(
+                        pos['symbol'], 
+                        action, 
+                        pos['volume'], 
+                        {'positionId': pos['id']}
+                    )
+                    print(f"✅ Closed position {pos['id']} for {pos['symbol']}")
+                except Exception as ce:
+                    print(f"💥 Failed to close individual position {pos['id']}: {ce}")
+                    
         except Exception as e:
-            print(f"Close positions error: {e}")
+            print(f"Close positions connection error: {e}")
 
 # ==================== API Endpoints ====================
 
 @app.route('/api/connect', methods=['POST'])
 def connect():
-    data = request.json
+    data = request.json or {}
     login = data.get('login')
     password = data.get('password')
     server = data.get('server')
-    daily_target = data.get('daily_target', 500)
-    max_loss_limit = data.get('max_loss_limit', -500)
+    daily_target = float(data.get('daily_target', 500.0))
+    max_loss_limit = -abs(float(data.get('max_loss_limit', 500.0)))
     
     if not all([login, password, server]):
         return jsonify({"status": "error", "message": "بيانات غير كاملة"}), 400
@@ -154,11 +180,19 @@ def connect():
                 'login': str(login),
                 'password': password,
                 'server': server,
-                'magic': 999111
+                'magic': 999111,
+                'keywords': ['trading-guardian']
             })
             
             await account.deploy()
             await account.wait_connected(timeout_in_seconds=30)
+            
+            # جلب البيانات الأولية للحساب لتخزين الـ Balance الصحيح
+            connection = account.get_rpc_connection()
+            await connection.connect()
+            await connection.wait_synchronized()
+            account_info = await connection.get_account_information()
+            initial_balance = float(account_info.get('balance', 0.0))
             
             session_id = f"session_{login}_{int(time.time())}"
             session_data = {
@@ -171,15 +205,15 @@ def connect():
                 'daily_target': daily_target,
                 'max_loss_limit': max_loss_limit,
                 'is_locked': False,
-                'daily_profit': 0,
-                'daily_loss': 0,
-                'balance': 0,
-                'equity': 0,
-                'drawdown': 0,
+                'daily_profit': 0.0,
+                'daily_loss': 0.0,
+                'balance': initial_balance,
+                'equity': initial_balance,
+                'drawdown': 0.0,
                 'positions_count': 0,
                 'max_trades_per_day': 4,
                 'trades_today': 0,
-                'initial_balance': 0
+                'initial_balance': initial_balance
             }
             
             update_session(session_id, session_data)
@@ -192,9 +226,10 @@ def connect():
             }
         
         result = run_async(register_account())
-        return jsonify(result), 201 if result['status'] == 'success' else 500
+        return jsonify(result), 201 if result.get('status') == 'success' else 500
         
     except Exception as e:
+        print(f"Connection API Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -213,47 +248,57 @@ def account_stats():
     if session.get('status') != 'connected':
         return jsonify({"status": "error", "message": "الحساب غير متصل"}), 400
     
+    # التحقق من حالة القفل الزمني وفكه تلقائياً إن انتهى الوقت
     if session.get('is_locked'):
         unlock_time_str = session.get('unlock_at')
         try:
             unlock_time = datetime.fromisoformat(unlock_time_str)
-            if datetime.now() < unlock_time:
+            if datetime.utcnow() < unlock_time:
                 return jsonify({
                     "status": "locked",
                     "reason": session.get('lockdown_reason'),
                     "locked_until": session.get('unlock_at'),
-                    "message": "الحساب مقفول حالياً"
+                    "message": "الحساب مقفول حالياً لحمايتك من السوق"
                 }), 200
             else:
                 session['is_locked'] = False
                 update_session(session_id, session)
-        except:
-            pass
+        except Exception as e:
+            print(f"Error checking unlock time: {e}")
     
     try:
         async def fetch_data():
             account_id = session.get('account_id')
             account = await api.metatrader_account_api.get_account(account_id)
             
-            state = await account.get_account_information()
-            positions = await account.get_positions()
+            if account.state != 'DEPLOYED':
+                await account.deploy()
             
-            balance = float(state.balance) if hasattr(state, 'balance') else 0.0
-            equity = float(state.equity) if hasattr(state, 'equity') else balance
+            # 🔌 تشغيل الـ RPC Connection لجلب البيانات بشكل صحيح بنسبة 100%
+            connection = account.get_rpc_connection()
+            await connection.connect()
+            await connection.wait_synchronized()
+            
+            state = await connection.get_account_information()
+            positions = await connection.get_positions()
+            
+            balance = float(state.get('balance', 0.0)) if isinstance(state, dict) else float(state.balance)
+            equity = float(state.get('equity', 0.0)) if isinstance(state, dict) else float(state.equity)
+            
             current_pnl = equity - balance
-            drawdown_percent = ((balance - equity) / balance * 100) if balance > 0 else 0.0
+            drawdown_percent = ((balance - equity) / balance * 100) if balance > equity else 0.0
             
             if session.get('initial_balance', 0) == 0 and balance > 0:
                 session['initial_balance'] = balance
             
-            initial_balance = session.get('initial_balance', balance) or balance
+            initial_balance = session.get('initial_balance', balance)
             overall_growth = ((balance - initial_balance) / initial_balance * 100) if initial_balance > 0 else 0.0
             
             session.update({
                 'balance': balance,
                 'equity': equity,
-                'daily_profit': float(current_pnl) if current_pnl > 0 else 0,
-                'daily_loss': float(current_pnl) if current_pnl < 0 else 0,
+                'daily_profit': float(current_pnl) if current_pnl > 0 else 0.0,
+                'daily_loss': float(current_pnl) if current_pnl < 0 else 0.0,
                 'drawdown': float(abs(drawdown_percent)),
                 'positions_count': len(positions),
                 'last_update': datetime.now().isoformat()
@@ -268,6 +313,7 @@ def account_stats():
                     "current_pnl": float(current_pnl),
                     "drawdown_percent": float(abs(drawdown_percent)),
                     "daily_profit": float(current_pnl) if current_pnl > 0 else 0.0,
+                    "daily_loss": float(current_pnl) if current_pnl < 0 else 0.0,
                     "overall_growth": float(overall_growth),
                     "open_trades": len(positions),
                     "is_locked": session.get('is_locked', False),
@@ -276,10 +322,10 @@ def account_stats():
             }
         
         result = run_async(fetch_data())
-        return jsonify(result), 200 if result['status'] == 'success' else 500
+        return jsonify(result), 200 if result.get('status') == 'success' else 500
         
     except Exception as e:
-        print(f"Error fetching data: {e}")
+        print(f"Error fetching data from MT5: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -303,13 +349,13 @@ def disconnect():
             
             session['status'] = 'disconnected'
             update_session(session_id, session)
-            
-            return {"status": "success", "message": "تم قطع الاتصال"}
+            return {"status": "success", "message": "تم قطع الاتصال وحذف الـ Deployment بنجاح"}
         
         result = run_async(undeploy_account())
-        return jsonify(result), 200 if result['status'] == 'success' else 500
+        return jsonify(result), 200 if result.get('status') == 'success' else 500
         
     except Exception as e:
+        print(f"Disconnect Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -318,7 +364,7 @@ def emergency_close():
     data = request.json or {}
     session_id = data.get('session_id')
     reason = data.get('reason', 'manual')
-    lockout_hours = data.get('lockout_hours', 2)
+    lockout_hours = int(data.get('lockout_hours', 2))
     
     if not session_id:
         return jsonify({"status": "error", "message": "session_id مطلوب"}), 400
@@ -334,9 +380,15 @@ def emergency_close():
             account = await api.metatrader_account_api.get_account(account_id)
             if account.state != 'DEPLOYED':
                 await account.deploy()
-            positions = await account.get_positions()
-            for position in positions:
-                await account.close_position_by_symbol(position.symbol)
+            
+            connection = account.get_rpc_connection()
+            await connection.connect()
+            await connection.wait_synchronized()
+            
+            positions = await connection.get_positions()
+            for pos in positions:
+                action = 'SELL' if pos['type'] == 'POSITION_TYPE_BUY' else 'BUY'
+                await connection.create_market_order(pos['symbol'], action, pos['volume'], {'positionId': pos['id']})
             return True
         
         run_async(close_positions())
@@ -349,10 +401,11 @@ def emergency_close():
         
         return jsonify({
             "status": "success",
-            "message": f"تم الإغلاق الطارئ: {reason}"
+            "message": f"تم الإغلاق الطارئ بنجاح وتفعيل الحظر بطلب: {reason}"
         }), 200
         
     except Exception as e:
+        print(f"Emergency API Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -369,19 +422,17 @@ def update_targets():
         return jsonify({"status": "error", "message": "جلسة غير موجودة"}), 404
     
     if 'daily_profit_target' in data:
-        session['daily_target'] = data['daily_profit_target']
+        session['daily_target'] = float(data['daily_profit_target'])
     if 'daily_stop_loss' in data:
-        session['max_loss_limit'] = -abs(data['daily_stop_loss'])
+        session['max_loss_limit'] = -abs(float(data['daily_stop_loss']))
     if 'lockout_hours' in data:
-        session['lockout_hours'] = data['lockout_hours']
-    if 'early_warning' in data:
-        session['early_warning'] = data['early_warning']
+        session['lockout_hours'] = int(data['lockout_hours'])
     
     update_session(session_id, session)
     
     return jsonify({
         "status": "success",
-        "message": "تم تحديث الإعدادات"
+        "message": "تم تحديث إعدادات الأهداف والمخاطر بنجاح"
     }), 200
 
 
@@ -392,15 +443,16 @@ def manual_unlock(session_id):
         return jsonify({"status": "error", "message": "جلسة غير موجودة"}), 404
     
     session['is_locked'] = False
+    session['unlock_at'] = datetime.now().isoformat()
     update_session(session_id, session)
     
-    return jsonify({"status": "success", "message": "تم فك الحظر"}), 200
+    return jsonify({"status": "success", "message": "تم فك الحظر اليدوي بنجاح"}), 200
 
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
-        "status": "السيرفر يعمل",
+        "status": "السيرفر يعمل بكفاءة",
         "timestamp": datetime.now().isoformat(),
         "active_sessions": len(SHARED_SESSION)
     }), 200
