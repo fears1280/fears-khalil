@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import asyncio
+from metaapi_cloud_sdk import MetaApi # استيراد الحزمة فقط هنا دون تشغيلها عالمياً
 
 app = Flask(__name__)
 CORS(app)
@@ -14,9 +15,6 @@ CORS(app)
 API_TOKEN = os.getenv("METAAPI_TOKEN")
 if not API_TOKEN:
     raise ValueError("METAAPI_TOKEN غير موجود في متغيرات البيئة!")
-
-from metaapi_cloud_sdk import MetaApi
-api = MetaApi(API_TOKEN)
 
 # ==================== إدارة الجلسات ====================
 SESSIONS_FILE = "guardian_sessions.json"
@@ -117,8 +115,8 @@ class RiskMonitor(threading.Thread):
             update_session(session_id, session)
             print(f"🔒 Account {session_id} locked successfully. Reason: {reason}")
             
-            # اختياري: عمل undeploy للحساب لفصله تماماً سحابياً ومنع الدخول العشوائي
             async def stop_acc():
+                api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
                 acc = await api.metatrader_account_api.get_account(account_id)
                 await acc.undeploy()
             try:
@@ -131,11 +129,11 @@ class RiskMonitor(threading.Thread):
             
     async def close_all_positions(self, account_id):
         try:
+            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
             account = await api.metatrader_account_api.get_account(account_id)
             if account.state != 'DEPLOYED':
                 await account.deploy()
             
-            # 🔌 الربط الصحيح عبر الـ RPC Connection لجلب وإغلاق الصفقات
             connection = account.get_rpc_connection()
             await connection.connect()
             await connection.wait_synchronized()
@@ -173,6 +171,7 @@ def connect():
     
     try:
         async def register_account():
+            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
             account = await api.metatrader_account_api.create_account({
                 'name': f'Guardian_{login}_{int(time.time())}',
                 'type': 'cloud',
@@ -187,7 +186,6 @@ def connect():
             await account.deploy()
             await account.wait_connected(timeout_in_seconds=30)
             
-            # جلب البيانات الأولية للحساب لتخزين الـ Balance الصحيح
             connection = account.get_rpc_connection()
             await connection.connect()
             await connection.wait_synchronized()
@@ -248,7 +246,6 @@ def account_stats():
     if session.get('status') != 'connected':
         return jsonify({"status": "error", "message": "الحساب غير متصل"}), 400
     
-    # التحقق من حالة القفل الزمني وفكه تلقائياً إن انتهى الوقت
     if session.get('is_locked'):
         unlock_time_str = session.get('unlock_at')
         try:
@@ -268,13 +265,13 @@ def account_stats():
     
     try:
         async def fetch_data():
+            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
             account_id = session.get('account_id')
             account = await api.metatrader_account_api.get_account(account_id)
             
             if account.state != 'DEPLOYED':
                 await account.deploy()
             
-            # 🔌 تشغيل الـ RPC Connection لجلب البيانات بشكل صحيح بنسبة 100%
             connection = account.get_rpc_connection()
             await connection.connect()
             await connection.wait_synchronized()
@@ -343,6 +340,7 @@ def disconnect():
     
     try:
         async def undeploy_account():
+            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
             account_id = session.get('account_id')
             account = await api.metatrader_account_api.get_account(account_id)
             await account.undeploy()
@@ -377,6 +375,7 @@ def emergency_close():
         account_id = session.get('account_id')
         
         async def close_positions():
+            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
             account = await api.metatrader_account_api.get_account(account_id)
             if account.state != 'DEPLOYED':
                 await account.deploy()
