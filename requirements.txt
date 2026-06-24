@@ -5,3 +5,4 @@ python-socketio
 python-engineio
 eventlet
 metaapi-cloud-sdk>=29.0.0
+gunicorn
