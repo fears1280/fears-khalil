@@ -1,3 +1,4 @@
 Flask
 flask-cors
 metaapi-cloud-sdk
+gunicorn
