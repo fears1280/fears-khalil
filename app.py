@@ -171,19 +171,38 @@ def connect():
     
     try:
         async def register_account():
-            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
-            account = await api.metatrader_account_api.create_account({
-                'name': f'Guardian_{login}_{int(time.time())}',
-                'type': 'cloud',
-                'platform': 'mt5',
-                'login': str(login),
-                'password': password,
-                'server': server,
-                'magic': 999111,
-                'keywords': ['trading-guardian']
-            })
+            api = MetaApi(API_TOKEN)
             
-            await account.deploy()
+            # 1. جلب كل الحسابات الموجودة حالياً على MetaApi للتحقق
+            existing_accounts = await api.metatrader_account_api.get_accounts()
+            account = None
+            
+            # البحث عن الحساب برقم الـ Login لمنع التكرار العشوائي
+            for acc in existing_accounts:
+                acc_login = getattr(acc, 'login', None) or (acc.get('login') if isinstance(acc, dict) else None)
+                if str(acc_login) == str(login):
+                    account = acc
+                    print(f"♻️ Found existing MetaApi account for login: {login}")
+                    break
+            
+            # 2. إذا لم نجد حساباً مسجلاً مسبقاً، نقوم بإنشاء واحد جديد
+            if not account:
+                print(f"✨ Creating new MetaApi account for login: {login}")
+                account = await api.metatrader_account_api.create_account({
+                    'name': f'Guardian_{login}',
+                    'type': 'cloud',
+                    'platform': 'mt5',
+                    'login': str(login),
+                    'password': password,
+                    'server': server,
+                    'magic': 999111,
+                    'keywords': ['trading-guardian']
+                })
+            
+            # 3. التأكد من أن الحساب مفعّل (Deployed) على السيرفر
+            if account.state != 'DEPLOYED':
+                await account.deploy()
+            
             await account.wait_connected(timeout_in_seconds=30)
             
             connection = account.get_rpc_connection()
@@ -192,6 +211,7 @@ def connect():
             account_info = await connection.get_account_information()
             initial_balance = float(account_info.get('balance', 0.0))
             
+            # إنشاء جلسة فريدة للتطبيق
             session_id = f"session_{login}_{int(time.time())}"
             session_data = {
                 'session_id': session_id,
@@ -220,7 +240,7 @@ def connect():
                 "status": "success",
                 "session_id": session_id,
                 "account_id": account.id,
-                "message": "تم الاتصال بنجاح!"
+                "message": "تم الاتصال بنجاح وتأمين الحساب من التكرار!"
             }
         
         result = run_async(register_account())
