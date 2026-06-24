@@ -116,5 +116,5 @@ def connect():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    # تشغيل السيرفر باستخدام SocketIO بدلاً من app.run التقليدية
-    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+    # التشغيل الآمن للـ WebSockets
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
