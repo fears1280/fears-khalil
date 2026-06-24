@@ -1,7 +1,8 @@
-import sys
-from flask import globals
-# خدعة ذكية لحقن الـ stack المحذوف في النسخ الجديدة من Flask لضمان عمل SocketIO 4
-sys.modules['flask.helpers'] = globals
+import flask
+from werkzeug.local import LocalStack
+# حل مشكلة تعارض Flask 3 مع SocketIO 4 غصب عن السيرفر
+flask._request_ctx_stack = LocalStack()
+
 import os
 import asyncio
 import threading
