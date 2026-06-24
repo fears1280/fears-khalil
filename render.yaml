@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: trading-guardian-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --worker-class gthread --threads 100 app:app
+    envVars:
+      - key: METAAPI_TOKEN
+        sync: true
+      - key: PYTHON_VERSION
+        value: 3.11.9
