@@ -1,3 +1,7 @@
+import sys
+from flask import globals
+# خدعة ذكية لحقن الـ stack المحذوف في النسخ الجديدة من Flask لضمان عمل SocketIO 4
+sys.modules['flask.helpers'] = globals
 import os
 import asyncio
 import threading
