@@ -163,8 +163,14 @@ def connect():
     login = data.get('login')
     password = data.get('password')
     server = data.get('server')
-    daily_target = float(data.get('daily_target', 500.0))
-    max_loss_limit = -abs(float(data.get('max_loss_limit', 500.0)))
+    
+    # تأمين تحويل الأرقام من فلاتر لمنع الانهيار اللحظي
+    try:
+        daily_target = float(data.get('daily_target', 500.0))
+        max_loss_limit = -abs(float(data.get('max_loss_limit', 500.0)))
+    except (ValueError, TypeError):
+        daily_target = 500.0
+        max_loss_limit = -500.0
     
     if not all([login, password, server]):
         return jsonify({"status": "error", "message": "بيانات غير كاملة"}), 400
@@ -172,20 +178,33 @@ def connect():
     try:
         async def register_account():
             api = MetaApi(API_TOKEN)
-            
-            # 1. جلب كل الحسابات الموجودة حالياً على MetaApi للتحقق
-            existing_accounts = await api.metatrader_account_api.get_accounts()
             account = None
             
-            # البحث عن الحساب برقم الـ Login لمنع التكرار العشوائي
-            for acc in existing_accounts:
-                acc_login = getattr(acc, 'login', None) or (acc.get('login') if isinstance(acc, dict) else None)
-                if str(acc_login) == str(login):
-                    account = acc
-                    print(f"♻️ Found existing MetaApi account for login: {login}")
-                    break
+            # محاولة الفحص الذكي وتخطيها فوراً لو حدث أي تعارض في حزمة MetaApi
+            try:
+                print("🔄 Checking existing accounts on MetaApi...")
+                existing_accounts = await api.metatrader_account_api.get_accounts()
+                
+                if existing_accounts and isinstance(existing_accounts, list):
+                    for acc in existing_accounts:
+                        try:
+                            # فحص مرن يدعم الكائنات والقواميس (Dict)
+                            acc_login = None
+                            if isinstance(acc, dict):
+                                acc_login = acc.get('login')
+                            else:
+                                acc_login = getattr(acc, 'login', None) or (acc.get('login') if hasattr(acc, 'get') else None)
+                            
+                            if acc_login and str(acc_login) == str(login):
+                                account = acc
+                                print(f"♻️ Found existing account for login: {login}")
+                                break
+                        except:
+                            continue
+            except Exception as check_error:
+                print(f"⚠️ Safe bypass: Quick check failed ({check_error}), proceeding to direct registration.")
             
-            # 2. إذا لم نجد حساباً مسجلاً مسبقاً، نقوم بإنشاء واحد جديد
+            # إذا لم نجد الحساب أو فشل الفحص، نقوم بالإنشاء مباشرة
             if not account:
                 print(f"✨ Creating new MetaApi account for login: {login}")
                 account = await api.metatrader_account_api.create_account({
@@ -193,14 +212,21 @@ def connect():
                     'type': 'cloud',
                     'platform': 'mt5',
                     'login': str(login),
-                    'password': password,
-                    'server': server,
+                    'password': str(password),
+                    'server': str(server),
                     'magic': 999111,
                     'keywords': ['trading-guardian']
                 })
             
-            # 3. التأكد من أن الحساب مفعّل (Deployed) على السيرفر
-            if account.state != 'DEPLOYED':
+            # التحقق من تشغيل الحساب
+            try:
+                account_state = account.state if hasattr(account, 'state') else account.get('state', '')
+                account_id = account.id if hasattr(account, 'id') else account.get('id')
+            except:
+                account_state = 'UNKNOWN'
+                account_id = getattr(account, 'id', None)
+                
+            if account_state != 'DEPLOYED':
                 await account.deploy()
             
             await account.wait_connected(timeout_in_seconds=30)
@@ -211,11 +237,10 @@ def connect():
             account_info = await connection.get_account_information()
             initial_balance = float(account_info.get('balance', 0.0))
             
-            # إنشاء جلسة فريدة للتطبيق
             session_id = f"session_{login}_{int(time.time())}"
             session_data = {
                 'session_id': session_id,
-                'account_id': account.id,
+                'account_id': account_id,
                 'login': login,
                 'server': server,
                 'status': 'connected',
@@ -239,15 +264,18 @@ def connect():
             return {
                 "status": "success",
                 "session_id": session_id,
-                "account_id": account.id,
-                "message": "تم الاتصال بنجاح وتأمين الحساب من التكرار!"
+                "account_id": account_id,
+                "message": "تم الاتصال بنجاح وتأمين الحساب!"
             }
         
         result = run_async(register_account())
-        return jsonify(result), 201 if result.get('status') == 'success' else 500
-        
+        if result and result.get('status') == 'success':
+            return jsonify(result), 201
+        else:
+            return jsonify({"status": "error", "message": result.get('message', 'فشلت عملية التهيئة')}), 500
+            
     except Exception as e:
-        print(f"Connection API Error: {e}")
+        print(f"Connection API Critical Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
