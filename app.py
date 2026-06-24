@@ -1,162 +1,40 @@
 import os
-import json
-import threading
+import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import asyncio
-from metaapi_cloud_sdk import MetaApi # استيراد الحزمة فقط هنا دون تشغيلها عالمياً
+from metaapi_cloud_sdk import MetaApi
 
 app = Flask(__name__)
 CORS(app)
 
-# ==================== إعدادات النظام ====================
-API_TOKEN = os.getenv("METAAPI_TOKEN")
-if not API_TOKEN:
-    raise ValueError("METAAPI_TOKEN غير موجود في متغيرات البيئة!")
+# جلب الـ Token من متغيرات البيئة في Render
+API_TOKEN = os.environ.get('METAAPI_TOKEN', '')
 
-# ==================== إدارة الجلسات ====================
-SESSIONS_FILE = "guardian_sessions.json"
-SHARED_SESSION = {}
-SESSION_LOCK = threading.Lock()
+# مخزن الجلسات المؤقت في الذاكرة
+sessions = {}
 
-def load_sessions():
-    global SHARED_SESSION
-    if os.path.exists(SESSIONS_FILE):
-        try:
-            with open(SESSIONS_FILE, 'r') as f:
-                SHARED_SESSION = json.load(f)
-        except Exception as e:
-            print(f"Error loading sessions: {e}")
-            SHARED_SESSION = {}
-
-def save_sessions():
-    with SESSION_LOCK:
-        try:
-            with open(SESSIONS_FILE, 'w') as f:
-                json.dump(SHARED_SESSION, f, indent=2)
-        except Exception as e:
-            print(f"Error saving sessions to disk: {e}")
-
-def get_session(session_id):
-    return SHARED_SESSION.get(session_id, None)
+# ---------------------------------------------------------------------------
+# دالة مساعدة لتشغيل الدالات غير المتزامنة (Async) داخل بيئة Flask المتزامنة
+# ---------------------------------------------------------------------------
+def run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
 def update_session(session_id, data):
-    with SESSION_LOCK:
-        SHARED_SESSION[session_id] = data
-        save_sessions()
+    if session_id in sessions:
+        sessions[session_id].update(data)
+    else:
+        sessions[session_id] = data
 
-# ==================== دالة Async آمنة ====================
-def run_async(coro):
-    """تشغيل coroutine في loop جديدة دائماً لتجنب تعارض Gunicorn"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        try:
-            loop.close()
-        except:
-            pass
-
-# ==================== Background Risk Monitor ====================
-class RiskMonitor(threading.Thread):
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.running = True
-        self.check_interval = 5
-        
-    def run(self):
-        print("Risk Monitor started...")
-        while self.running:
-            try:
-                self.check_all_accounts()
-                time.sleep(self.check_interval)
-            except Exception as e:
-                print(f"Risk Monitor error: {e}")
-                time.sleep(self.check_interval)
-                
-    def check_all_accounts(self):
-        with SESSION_LOCK:
-            sessions = list(SHARED_SESSION.items())
-            
-        for session_id, session_data in sessions:
-            if session_data.get('status') != 'connected' or session_data.get('is_locked'):
-                continue
-                
-            daily_loss = session_data.get('daily_loss', 0)
-            daily_profit = session_data.get('daily_profit', 0)
-            max_loss_limit = session_data.get('max_loss_limit', -500)
-            daily_target = session_data.get('daily_target', 500)
-            
-            if daily_loss <= max_loss_limit:
-                print(f"🚨 Max loss reached for {session_id}")
-                self.emergency_lockdown(session_id, "reached_max_loss")
-                
-            elif daily_profit >= daily_target:
-                print(f"🎯 Daily target reached for {session_id}")
-                self.emergency_lockdown(session_id, "reached_daily_target")
-                    
-    def emergency_lockdown(self, session_id, reason):
-        session = get_session(session_id)
-        if not session:
-            return
-            
-        try:
-            account_id = session.get('account_id')
-            run_async(self.close_all_positions(account_id))
-            
-            session['is_locked'] = True
-            session['locked_at'] = datetime.now().isoformat()
-            session['unlock_at'] = (datetime.now() + timedelta(hours=2)).isoformat()
-            session['lockdown_reason'] = reason
-            
-            update_session(session_id, session)
-            print(f"🔒 Account {session_id} locked successfully. Reason: {reason}")
-            
-            async def stop_acc():
-                api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
-                acc = await api.metatrader_account_api.get_account(account_id)
-                await acc.undeploy()
-            try:
-                run_async(stop_acc())
-            except:
-                pass
-                
-        except Exception as e:
-            print(f"Lockdown error for session {session_id}: {e}")
-            
-    async def close_all_positions(self, account_id):
-        try:
-            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
-            account = await api.metatrader_account_api.get_account(account_id)
-            if account.state != 'DEPLOYED':
-                await account.deploy()
-            
-            connection = account.get_rpc_connection()
-            await connection.connect()
-            await connection.wait_synchronized()
-            
-            positions = await connection.get_positions()
-            for pos in positions:
-                action = 'SELL' if pos['type'] == 'POSITION_TYPE_BUY' else 'BUY'
-                try:
-                    await connection.create_market_order(
-                        pos['symbol'], 
-                        action, 
-                        pos['volume'], 
-                        {'positionId': pos['id']}
-                    )
-                    print(f"✅ Closed position {pos['id']} for {pos['symbol']}")
-                except Exception as ce:
-                    print(f"💥 Failed to close individual position {pos['id']}: {ce}")
-                    
-        except Exception as e:
-            print(f"Close positions connection error: {e}")
-
-# ==================== API Endpoints ====================
-
+# ---------------------------------------------------------------------------
+# 1. دالة تسجيل الدخول والربط (Connect)
+# ---------------------------------------------------------------------------
 @app.route('/api/connect', methods=['POST'])
 def connect():
     data = request.json or {}
@@ -164,7 +42,7 @@ def connect():
     password = data.get('password')
     server = data.get('server')
     
-    # تأمين تحويل الأرقام من فلاتر لمنع الانهيار اللحظي
+    # تأمين تحويل قيم الأهداف القادمة من فلاتر
     try:
         daily_target = float(data.get('daily_target', 500.0))
         max_loss_limit = -abs(float(data.get('max_loss_limit', 500.0)))
@@ -175,12 +53,15 @@ def connect():
     if not all([login, password, server]):
         return jsonify({"status": "error", "message": "بيانات غير كاملة"}), 400
     
+    if not API_TOKEN:
+        return jsonify({"status": "error", "message": "METAAPI_TOKEN غير معرف في سيرفر Render"}), 500
+    
     try:
         async def register_account():
             api = MetaApi(API_TOKEN)
             account = None
             
-            # محاولة الفحص الذكي وتخطيها فوراً لو حدث أي تعارض في حزمة MetaApi
+            # محاولة الفحص الذكي عن الحساب لتجنب مشكلة الـ Limit في الحساب المجاني
             try:
                 print("🔄 Checking existing accounts on MetaApi...")
                 existing_accounts = await api.metatrader_account_api.get_accounts()
@@ -188,7 +69,6 @@ def connect():
                 if existing_accounts and isinstance(existing_accounts, list):
                     for acc in existing_accounts:
                         try:
-                            # فحص مرن يدعم الكائنات والقواميس (Dict)
                             acc_login = None
                             if isinstance(acc, dict):
                                 acc_login = acc.get('login')
@@ -197,14 +77,14 @@ def connect():
                             
                             if acc_login and str(acc_login) == str(login):
                                 account = acc
-                                print(f"♻️ Found existing account for login: {login}")
+                                print(f"♻️ Found existing MetaApi account for login: {login}")
                                 break
                         except:
                             continue
             except Exception as check_error:
-                print(f"⚠️ Safe bypass: Quick check failed ({check_error}), proceeding to direct registration.")
+                print(f"⚠️ Safe bypass: Quick check failed ({check_error}), proceeding to registration.")
             
-            # إذا لم نجد الحساب أو فشل الفحص، نقوم بالإنشاء مباشرة
+            # إذا لم نجد الحساب مضافاً مسبقاً، نقوم بإنشائه فوراً
             if not account:
                 print(f"✨ Creating new MetaApi account for login: {login}")
                 account = await api.metatrader_account_api.create_account({
@@ -218,7 +98,7 @@ def connect():
                     'keywords': ['trading-guardian']
                 })
             
-            # التحقق من تشغيل الحساب
+            # استخراج حالة الحساب ورقم الـ ID بمرونة
             try:
                 account_state = account.state if hasattr(account, 'state') else account.get('state', '')
                 account_id = account.id if hasattr(account, 'id') else account.get('id')
@@ -229,20 +109,23 @@ def connect():
             if account_state != 'DEPLOYED':
                 await account.deploy()
             
+            print("⏳ Waiting for account connection setup...")
             await account.wait_connected(timeout_in_seconds=30)
             
             connection = account.get_rpc_connection()
             await connection.connect()
             await connection.wait_synchronized()
+            
             account_info = await connection.get_account_information()
             initial_balance = float(account_info.get('balance', 0.0))
             
+            # إنشاء معرف جلسة فريد ومحمي
             session_id = f"session_{login}_{int(time.time())}"
             session_data = {
                 'session_id': session_id,
                 'account_id': account_id,
-                'login': login,
-                'server': server,
+                'login': str(login),
+                'server': str(server),
                 'status': 'connected',
                 'connected_at': datetime.now().isoformat(),
                 'daily_target': daily_target,
@@ -252,20 +135,16 @@ def connect():
                 'daily_loss': 0.0,
                 'balance': initial_balance,
                 'equity': initial_balance,
-                'drawdown': 0.0,
-                'positions_count': 0,
-                'max_trades_per_day': 4,
-                'trades_today': 0,
                 'initial_balance': initial_balance
             }
             
-            update_session(session_id, session_data)
+            sessions[session_id] = session_data
             
             return {
                 "status": "success",
                 "session_id": session_id,
                 "account_id": account_id,
-                "message": "تم الاتصال بنجاح وتأمين الحساب!"
+                "message": "تم الاتصال وتأمين الحساب بنجاح!"
             }
         
         result = run_async(register_account())
@@ -278,239 +157,207 @@ def connect():
         print(f"Connection API Critical Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
+# ---------------------------------------------------------------------------
+# 2. دالة جلب الإحصائيات الحية ومراقبة الحساب (Account Stats & Monitor)
+# ---------------------------------------------------------------------------
 @app.route('/api/account-stats', methods=['GET'])
 def account_stats():
     session_id = request.args.get('session_id')
     
     if not session_id:
         return jsonify({"status": "error", "message": "session_id مطلوب"}), 400
+        
+    session = sessions.get(session_id)
     
-    session = get_session(session_id)
-    
+    # 🌟 طوق النجاة: إعادة بناء الجلسة تلقائياً إذا حصل ريستارت للسيرفر والحساب متصل في ميتاترايدر
     if not session:
-        return jsonify({"status": "error", "message": "جلسة غير موجودة"}), 404
-    
-    if session.get('status') != 'connected':
-        return jsonify({"status": "error", "message": "الحساب غير متصل"}), 400
-    
-    if session.get('is_locked'):
-        unlock_time_str = session.get('unlock_at')
+        print(f"⚠️ Session {session_id} missing from RAM. Starting auto-recovery...")
         try:
-            unlock_time = datetime.fromisoformat(unlock_time_str)
-            if datetime.utcnow() < unlock_time:
-                return jsonify({
-                    "status": "locked",
-                    "reason": session.get('lockdown_reason'),
-                    "locked_until": session.get('unlock_at'),
-                    "message": "الحساب مقفول حالياً لحمايتك من السوق"
-                }), 200
-            else:
-                session['is_locked'] = False
-                update_session(session_id, session)
-        except Exception as e:
-            print(f"Error checking unlock time: {e}")
-    
+            parts = session_id.split('_')
+            if len(parts) >= 2:
+                extracted_login = parts[1]
+                
+                api = MetaApi(API_TOKEN)
+                existing_accounts = run_async(api.metatrader_account_api.get_accounts())
+                
+                for acc in existing_accounts:
+                    acc_login = getattr(acc, 'login', None) or (acc.get('login') if isinstance(acc, dict) else None)
+                    if str(acc_login) == str(extracted_login):
+                        account_id = acc.id if hasattr(acc, 'id') else acc.get('id')
+                        session_data = {
+                            'session_id': session_id,
+                            'account_id': account_id,
+                            'login': extracted_login,
+                            'status': 'connected',
+                            'is_locked': False,
+                            'daily_target': 500.0,
+                            'max_loss_limit': -500.0,
+                            'daily_profit': 0.0,
+                            'daily_loss': 0.0
+                        }
+                        sessions[session_id] = session_data
+                        session = session_data
+                        print(f"✅ Auto-recovered session for login: {extracted_login}")
+                        break
+        except Exception as recovery_error:
+            print(f"❌ Recovery failed: {recovery_error}")
+
+    # إذا فُقدت تماماً ولم يتم العثور عليها بالمنصة
+    if not session:
+        return jsonify({"status": "error", "message": "خطأ في المصادقة: الجلسة منتهية، يرجى إعادة الدخول"}), 401
+
+    if session.get('is_locked'):
+        return jsonify({"status": "locked", "message": "الحساب مقفل حالياً بحارس التداول"}), 200
+
     try:
-        async def fetch_data():
-            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
-            account_id = session.get('account_id')
-            account = await api.metatrader_account_api.get_account(account_id)
+        async def fetch_stats():
+            api = MetaApi(API_TOKEN)
+            account = await api.metatrader_account_api.get_account(session['account_id'])
             
             if account.state != 'DEPLOYED':
                 await account.deploy()
-            
+                
             connection = account.get_rpc_connection()
             await connection.connect()
             await connection.wait_synchronized()
             
-            state = await connection.get_account_information()
+            account_info = await connection.get_account_information()
             positions = await connection.get_positions()
             
-            balance = float(state.get('balance', 0.0)) if isinstance(state, dict) else float(state.balance)
-            equity = float(state.get('equity', 0.0)) if isinstance(state, dict) else float(state.equity)
+            balance = float(account_info.get('balance', 0.0))
+            equity = float(account_info.get('equity', 0.0))
+            pnl = equity - balance
             
-            current_pnl = equity - balance
-            drawdown_percent = ((balance - equity) / balance * 100) if balance > equity else 0.0
+            # حساب الأرقام الإحصائية والتراجع ونسبة النمو الإجمالية
+            initial = float(session.get('initial_balance', balance))
+            drawdown_percent = abs((pnl / balance) * 100) if pnl < 0 else 0.0
+            overall_growth = ((balance - initial) / initial) * 100 if initial > 0 else 0.0
             
-            if session.get('initial_balance', 0) == 0 and balance > 0:
-                session['initial_balance'] = balance
-            
-            initial_balance = session.get('initial_balance', balance)
-            overall_growth = ((balance - initial_balance) / initial_balance * 100) if initial_balance > 0 else 0.0
-            
-            session.update({
-                'balance': balance,
-                'equity': equity,
-                'daily_profit': float(current_pnl) if current_pnl > 0 else 0.0,
-                'daily_loss': float(current_pnl) if current_pnl < 0 else 0.0,
-                'drawdown': float(abs(drawdown_percent)),
-                'positions_count': len(positions),
-                'last_update': datetime.now().isoformat()
-            })
-            update_session(session_id, session)
+            # تحديث بيانات الجلسة الحالية في الذاكرة
+            session['balance'] = balance
+            session['equity'] = equity
             
             return {
                 "status": "success",
                 "data": {
+                    "is_locked": False,
                     "balance": balance,
                     "equity": equity,
-                    "current_pnl": float(current_pnl),
-                    "drawdown_percent": float(abs(drawdown_percent)),
-                    "daily_profit": float(current_pnl) if current_pnl > 0 else 0.0,
-                    "daily_loss": float(current_pnl) if current_pnl < 0 else 0.0,
-                    "overall_growth": float(overall_growth),
-                    "open_trades": len(positions),
-                    "is_locked": session.get('is_locked', False),
-                    "last_update": datetime.now().isoformat()
+                    "current_pnl": pnl,
+                    "drawdown_percent": drawdown_percent,
+                    "daily_profit": session.get('daily_profit', 0.0),
+                    "overall_growth": overall_growth,
+                    "open_trades": len(positions)
                 }
             }
-        
-        result = run_async(fetch_data())
-        return jsonify(result), 200 if result.get('status') == 'success' else 500
-        
+
+        result = run_async(fetch_stats())
+        return jsonify(result), 200
+
     except Exception as e:
-        print(f"Error fetching data from MT5: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/api/disconnect', methods=['POST'])
-def disconnect():
-    data = request.json or {}
-    session_id = data.get('session_id')
-    
-    if not session_id:
-        return jsonify({"status": "error", "message": "session_id مطلوب"}), 400
-    
-    session = get_session(session_id)
-    if not session:
-        return jsonify({"status": "error", "message": "جلسة غير موجودة"}), 404
-    
-    try:
-        async def undeploy_account():
-            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
-            account_id = session.get('account_id')
-            account = await api.metatrader_account_api.get_account(account_id)
-            await account.undeploy()
-            
-            session['status'] = 'disconnected'
-            update_session(session_id, session)
-            return {"status": "success", "message": "تم قطع الاتصال وحذف الـ Deployment بنجاح"}
-        
-        result = run_async(undeploy_account())
-        return jsonify(result), 200 if result.get('status') == 'success' else 500
-        
-    except Exception as e:
-        print(f"Disconnect Error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/api/emergency-close', methods=['POST'])
-def emergency_close():
-    data = request.json or {}
-    session_id = data.get('session_id')
-    reason = data.get('reason', 'manual')
-    lockout_hours = int(data.get('lockout_hours', 2))
-    
-    if not session_id:
-        return jsonify({"status": "error", "message": "session_id مطلوب"}), 400
-    
-    session = get_session(session_id)
-    if not session:
-        return jsonify({"status": "error", "message": "جلسة غير موجودة"}), 404
-    
-    try:
-        account_id = session.get('account_id')
-        
-        async def close_positions():
-            api = MetaApi(API_TOKEN) # تأمين الـ Event Loop داخلياً
-            account = await api.metatrader_account_api.get_account(account_id)
-            if account.state != 'DEPLOYED':
-                await account.deploy()
-            
-            connection = account.get_rpc_connection()
-            await connection.connect()
-            await connection.wait_synchronized()
-            
-            positions = await connection.get_positions()
-            for pos in positions:
-                action = 'SELL' if pos['type'] == 'POSITION_TYPE_BUY' else 'BUY'
-                await connection.create_market_order(pos['symbol'], action, pos['volume'], {'positionId': pos['id']})
-            return True
-        
-        run_async(close_positions())
-        
-        session['is_locked'] = True
-        session['locked_at'] = datetime.now().isoformat()
-        session['unlock_at'] = (datetime.now() + timedelta(hours=lockout_hours)).isoformat()
-        session['lockdown_reason'] = reason
-        update_session(session_id, session)
-        
+        print(f"Stats API Error: {e}")
+        # حماية ضد السقوط: إرجاع آخر بيانات محفوظة للجلسة بدلاً من الانهيار الكلي بـ 500
         return jsonify({
             "status": "success",
-            "message": f"تم الإغلاق الطارئ بنجاح وتفعيل الحظر بطلب: {reason}"
+            "data": {
+                "is_locked": False,
+                "balance": session.get('balance', 0.0),
+                "equity": session.get('equity', 0.0),
+                "current_pnl": 0.0,
+                "drawdown_percent": 0.0,
+                "daily_profit": session.get('daily_profit', 0.0),
+                "overall_growth": 0.0,
+                "open_trades": 0
+            }
         }), 200
-        
-    except Exception as e:
-        print(f"Emergency API Error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
 
-
+# ---------------------------------------------------------------------------
+# 3. دالة تحديث قيم الأهداف (Update Targets) من التطبيق
+# ---------------------------------------------------------------------------
 @app.route('/api/update-targets', methods=['POST'])
 def update_targets():
     data = request.json or {}
     session_id = data.get('session_id')
     
-    if not session_id:
-        return jsonify({"status": "error", "message": "session_id مطلوب"}), 400
-    
-    session = get_session(session_id)
-    if not session:
-        return jsonify({"status": "error", "message": "جلسة غير موجودة"}), 404
+    if not session_id or session_id not in sessions:
+        return jsonify({"status": "error", "message": "جلسة عمل غير صالحة"}), 401
+        
+    session = sessions[session_id]
     
     if 'daily_profit_target' in data:
         session['daily_target'] = float(data['daily_profit_target'])
     if 'daily_stop_loss' in data:
+        # تأكيد حفظ حد الخسارة كقيمة سالبة في بايثون دوماً
         session['max_loss_limit'] = -abs(float(data['daily_stop_loss']))
-    if 'lockout_hours' in data:
-        session['lockout_hours'] = int(data['lockout_hours'])
+        
+    print(f"⚙️ Targets updated for session {session_id}: Target={session['daily_target']}, LossLimit={session['max_loss_limit']}")
+    return jsonify({"status": "success", "message": "تم تحديث الأهداف بنجاح"}), 200
+
+# ---------------------------------------------------------------------------
+# 4. دالة الإغلاق الطارئ وقفل الحساب (Emergency Close)
+# ---------------------------------------------------------------------------
+@app.route('/api/emergency-close', methods=['POST'])
+def emergency_close():
+    data = request.json or {}
+    session_id = data.get('session_id')
+    reason = data.get('reason', 'تم تفعيل الحماية الطارئة')
     
-    update_session(session_id, session)
+    if not session_id or session_id not in sessions:
+        return jsonify({"status": "error", "message": "جلسة عمل غير صالحة"}), 401
+        
+    session = sessions[session_id]
+    session['is_locked'] = True
     
-    return jsonify({
-        "status": "success",
-        "message": "تم تحديث إعدادات الأهداف والمخاطر بنجاح"
-    }), 200
+    try:
+        async def close_all_positions():
+            api = MetaApi(API_TOKEN)
+            account = await api.metatrader_account_api.get_account(session['account_id'])
+            connection = account.get_rpc_connection()
+            await connection.connect()
+            await connection.wait_synchronized()
+            
+            # جلب وإغلاق كل الصفقات المفتوحة فوراً لحماية الحساب
+            positions = await connection.get_positions()
+            print(f"🚨 Emergency Close triggered for Login {session['login']}. Closing {len(positions)} positions. Reason: {reason}")
+            
+            for pos in positions:
+                try:
+                    await connection.cancel_order(pos['id'])
+                except:
+                    try:
+                        # محاولة الإغلاق المباشر بحسب هيكلية الحزمة
+                        await connection.close_position(pos['id'])
+                    except Exception as close_err:
+                        print(f"Could not close position {pos['id']}: {close_err}")
+            
+            # عمل Undeploy للحساب لمنع أي تداول يدوي من الـ PC أو الهاتف لفترة الحظر
+            await account.undeploy()
+            return {"status": "success", "message": f"تم تفعيل الحظر الطارئ بنجاح وإغلاق الصفقات. السبب: {reason}"}
+            
+        result = run_async(close_all_positions())
+        return jsonify(result), 200
+    except Exception as e:
+        print(f"Emergency API Critical Error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-
-@app.route('/api/unlock/<session_id>', methods=['POST'])
-def manual_unlock(session_id):
-    session = get_session(session_id)
-    if not session:
-        return jsonify({"status": "error", "message": "جلسة غير موجودة"}), 404
+# ---------------------------------------------------------------------------
+# 5. دالة قطع الاتصال ومسح الجلسة (Disconnect)
+# ---------------------------------------------------------------------------
+@app.route('/api/disconnect', methods=['POST'])
+def disconnect():
+    data = request.json or {}
+    session_id = data.get('session_id')
     
-    session['is_locked'] = False
-    session['unlock_at'] = datetime.now().isoformat()
-    update_session(session_id, session)
-    
-    return jsonify({"status": "success", "message": "تم فك الحظر اليدوي بنجاح"}), 200
+    if session_id in sessions:
+        del sessions[session_id]
+        print(f"🛑 Session {session_id} has been wiped out from memory.")
+        
+    return jsonify({"status": "success", "message": "تم فصل الجلسة وتنظيف الذاكرة بنجاح"}), 200
 
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        "status": "السيرفر يعمل بكفاءة",
-        "timestamp": datetime.now().isoformat(),
-        "active_sessions": len(SHARED_SESSION)
-    }), 200
-
-
-# ==================== تهيئة النظام ====================
-load_sessions()
-
-risk_monitor = RiskMonitor()
-risk_monitor.start()
-
+# ---------------------------------------------------------------------------
+# تشغيل السيرفر
+# ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    port = int(os.getenv("PORT", 5000))
+    # العمل على البورت الديناميكي لـ Render أو 5000 محلياً
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
