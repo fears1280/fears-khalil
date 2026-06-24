@@ -1,7 +1,17 @@
+import sys
 import flask
+import werkzeug.serving
 from werkzeug.local import LocalStack
-# حل مشكلة تعارض Flask 3 مع SocketIO 4 غصب عن السيرفر
+
+# 1️⃣ الخدعة الأولى: حل مشكلة الـ Stack المحذوف في Flask 3
 flask._request_ctx_stack = LocalStack()
+
+# 2️⃣ الخدعة الثانية: تزوير الدالة المحذوفة في Werkzeug 3 لمنع كراش الـ Import
+werkzeug.serving.run_with_reloader = lambda *args, **kwargs: None
+
+# ---------------------------------------------------------------------------
+# الآن استورد باقي مكتباتك المفضلة بأمان تسااام وبدون أي كراش!
+# --------------------------------
 
 import os
 import asyncio
