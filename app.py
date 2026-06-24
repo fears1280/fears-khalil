@@ -26,12 +26,6 @@ def run_async(coro):
         asyncio.set_event_loop(loop)
     return loop.run_until_complete(coro)
 
-def update_session(session_id, data):
-    if session_id in sessions:
-        sessions[session_id].update(data)
-    else:
-        sessions[session_id] = data
-
 # ---------------------------------------------------------------------------
 # 1. دالة تسجيل الدخول والربط (Connect)
 # ---------------------------------------------------------------------------
@@ -134,7 +128,6 @@ def connect():
             }
             
             sessions[session_id] = session_data
-            
             return {
                 "status": "success",
                 "session_id": session_id,
@@ -153,28 +146,24 @@ def connect():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ---------------------------------------------------------------------------
-# 2. دالة جلب الإحصائيات الحية ومراقبة الحساب النشط (منع التداول الحامي الحقيقي)
+# 2. دالة الإحصائيات والمراقبة الصارمة (تغلق أي صفقة جديدة لمح لمح البصر)
 # ---------------------------------------------------------------------------
 @app.route('/api/account-stats', methods=['GET'])
 def account_stats():
     session_id = request.args.get('session_id')
-    
     if not session_id:
         return jsonify({"status": "error", "message": "session_id مطلوب"}), 400
         
     session = sessions.get(session_id)
     
-    # استرداد الجلسة تلقائياً في حالة الريستارت لمنع الأصفار
+    # استرداد الجلسة تلقائياً في حالة ريستارت السيرفر لمنع الأصفار
     if not session:
-        print(f"⚠️ Session {session_id} missing from RAM. Starting auto-recovery...")
         try:
             parts = session_id.split('_')
             if len(parts) >= 2:
                 extracted_login = parts[1]
-                
                 api = MetaApi(API_TOKEN)
                 existing_accounts = run_async(api.metatrader_account_api.get_accounts())
-                
                 for acc in existing_accounts:
                     acc_login = getattr(acc, 'login', None) or (acc.get('login') if isinstance(acc, dict) else None)
                     if str(acc_login) == str(extracted_login):
@@ -194,16 +183,15 @@ def account_stats():
                         }
                         sessions[session_id] = session_data
                         session = session_data
-                        print(f"✅ Auto-recovered session for login: {extracted_login}")
                         break
         except Exception as recovery_error:
             print(f"❌ Recovery failed: {recovery_error}")
 
     if not session:
-        return jsonify({"status": "error", "message": "خطأ في المصادقة: الجلسة منتهية، يرجى إعادة الدخول"}), 401
+        return jsonify({"status": "error", "message": "خطأ في المصادقة: الجلسة منتهية"}), 401
 
     try:
-        async def fetch_stats():
+        async def fetch_stats_and_enforce_lock():
             api = MetaApi(API_TOKEN)
             account = await api.metatrader_account_api.get_account(session['account_id'])
             
@@ -227,36 +215,53 @@ def account_stats():
             
             session['balance'] = balance
             session['equity'] = equity
-            
-            # 🔥🔥 هنا السحر: إذا كان الحساب مغلقاً بسبب تخطي الأهداف وقام المستخدم بفتح صفقة جديدة عمداً
-            if session.get('is_locked') and len(positions) > 0:
-                print(f"🚨 User tried to trade during Lockout! Closing {len(positions)} unauthorized positions.")
-                for pos in positions:
-                    try:
-                        await connection.cancel_order(pos['id'])
-                    except:
+
+            # 🛑 المراقبة الصارمة: إذا قفلنا الحساب ووجدت صفقات مفتوحة (قام المستخدم بفتحها من الميتا)
+            if session.get('is_locked'):
+                if len(positions) > 0:
+                    print(f"🚨 LOCKOUT VIOLATION! User opened {len(positions)} trades. Closing them now!")
+                    for pos in positions:
+                        try:
+                            # محاولة الإغلاق عبر الطرق المتاحة في الـ SDK لضمان سحق الصفقة فوراً
+                            await connection.close_position(pos['id'])
+                        except:
+                            try:
+                                await connection.cancel_order(pos['id'])
+                            except:
+                                pass
+                    # تصفير المؤشر في الواجهة لأننا سحقنا الصفقة الجديدة فوراً
+                    positions = []
+
+            # 📈 الفحص التلقائي للهدف والخسارة من جهة السيرفر لمنع أي تلاعب
+            if not session.get('is_locked'):
+                daily_target = session.get('daily_target', 500.0)
+                max_loss_limit = session.get('max_loss_limit', -500.0)
+                
+                if pnl >= daily_target or pnl <= max_loss_limit:
+                    print(f"🎯 Target or Stop reached on server side! Locking down account.")
+                    session['is_locked'] = True
+                    for pos in positions:
                         try:
                             await connection.close_position(pos['id'])
                         except:
                             pass
-                # تصفير عدد الصفقات في الاستجابة لأننا أغلقناها فوراً
-                positions = []
-            
+                    positions = []
+
             return {
                 "status": "success",
                 "data": {
-                    "is_locked": session.get('is_locked', False), # نرسل حالة القفل الصحيحة دون تصفير الواجهة
+                    "is_locked": session.get('is_locked', False),
                     "balance": balance,
                     "equity": equity,
-                    "current_pnl": pnl,
-                    "drawdown_percent": drawdown_percent,
+                    "current_pnl": 0.0 if session.get('is_locked') else pnl,
+                    "drawdown_percent": 0.0 if session.get('is_locked') else drawdown_percent,
                     "daily_profit": session.get('daily_profit', 0.0),
                     "overall_growth": overall_growth,
                     "open_trades": len(positions)
                 }
             }
 
-        result = run_async(fetch_stats())
+        result = run_async(fetch_stats_and_enforce_lock())
         return jsonify(result), 200
 
     except Exception as e:
@@ -293,11 +298,10 @@ def update_targets():
     if 'daily_stop_loss' in data:
         session['max_loss_limit'] = -abs(float(data['daily_stop_loss']))
         
-    print(f"⚙️ Targets updated for session {session_id}: Target={session['daily_target']}, LossLimit={session['max_loss_limit']}")
     return jsonify({"status": "success", "message": "تم تحديث الأهداف بنجاح"}), 200
 
 # ---------------------------------------------------------------------------
-# 4. دالة الإغلاق الطارئ الذكية (تغلق الصفقات وتفعل القفل دون حذف البيانات)
+# 4. دالة الإغلاق الطارئ (عند تفعيل القفل من الواجهة)
 # ---------------------------------------------------------------------------
 @app.route('/api/emergency-close', methods=['POST'])
 def emergency_close():
@@ -309,8 +313,6 @@ def emergency_close():
         return jsonify({"status": "error", "message": "جلسة عمل غير صالحة"}), 401
         
     session = sessions[session_id]
-    
-    # تفعيل علامة القفل الداخلي مع بقاء الاتصال لقراءة البيانات
     session['is_locked'] = True
     
     try:
@@ -322,24 +324,16 @@ def emergency_close():
             await connection.wait_synchronized()
             
             positions = await connection.get_positions()
-            print(f"🚨 Target Reached for Login {session['login']}. Closing {len(positions)} positions. Reason: {reason}")
-            
             for pos in positions:
                 try:
-                    await connection.cancel_order(pos['id'])
+                    await connection.close_position(pos['id'])
                 except:
-                    try:
-                        await connection.close_position(pos['id'])
-                    except Exception as close_err:
-                        print(f"Could not close position {pos['id']}: {close_err}")
-            
-            # 🌟 تم إلغاء سطر الـ undeploy() لضمان استمرار قراءة الرصيد بنجاح دون أصفار!
-            return {"status": "success", "message": f"تم تفعيل القفل بنجاح، رصيدك آمن ولن تتمكن من التداول حتى انتهاء المدة. السبب: {reason}"}
+                    pass
+            return {"status": "success", "message": f"تم تفعيل القفل بنجاح: {reason}"}
             
         result = run_async(close_all_positions())
         return jsonify(result), 200
     except Exception as e:
-        print(f"Emergency API Critical Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ---------------------------------------------------------------------------
@@ -349,16 +343,10 @@ def emergency_close():
 def disconnect():
     data = request.json or {}
     session_id = data.get('session_id')
-    
     if session_id in sessions:
         del sessions[session_id]
-        print(f"🛑 Session {session_id} has been wiped out from memory.")
-        
-    return jsonify({"status": "success", "message": "تم فصل الجلسة وتنظيف الذاكرة بنجاح"}), 200
+    return jsonify({"status": "success", "message": "تم فصل الجلسة بنجاح"}), 200
 
-# ---------------------------------------------------------------------------
-# تشغيل السيرفر
-# ---------------------------------------------------------------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
