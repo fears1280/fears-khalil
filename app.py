@@ -1,6 +1,26 @@
 import os
 import asyncio
 import logging
+import os
+import asyncio
+from flask import Flask, jsonify, request
+from metaapi_cloud_sdk import MetaApi
+
+app = Flask(__name__)
+API_TOKEN = os.environ.get('METAAPI_TOKEN', '')
+
+@app.route('/api/debug-check', methods=['GET'])
+def debug():
+    try:
+        api = MetaApi(API_TOKEN)
+        acc_api = api.metatrader_account_api
+        # هذا السطر للتشخيص: يطبع لنا ما هي الدوال المتاحة
+        methods = [m for m in dir(acc_api) if not m.startswith('_')]
+        return jsonify({"available_methods": methods})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+# ... باقي الكود الخاص بك ...
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from metaapi_cloud_sdk import MetaApi
