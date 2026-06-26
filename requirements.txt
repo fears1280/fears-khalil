@@ -1,5 +1,5 @@
-Flask
-flask-cors
-metaapi-cloud-sdk
-gunicorn
-redis
+Flask==2.3.3
+Flask-Cors==4.0.0
+gunicorn==21.2.0
+metaapi-cloud-sdk==30.0.0
+python-dotenv==1.0.0
