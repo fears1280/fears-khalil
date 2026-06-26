@@ -2,24 +2,8 @@ services:
   - type: web
     name: trading-guardian-backend
     runtime: python
-    
-    # بناء المشروع
     buildCommand: pip install -r requirements.txt
-    
-    # أمر البدء - استخدام Gunicorn مع إعدادات صحيحة
-    startCommand: gunicorn --worker-class gthread --threads 20 --workers 2 --timeout 120 --bind 0.0.0.0:$PORT app:app
-    
-    # متغيرات البيئة
+    startCommand: gunicorn --worker-class gthread --threads 100 app:app
     envVars:
       - key: METAAPI_TOKEN
-        sync: false  # اجعلها false لتتمكن من تحديثها يدوياً
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: RENDER
-        value: true
-
-    # صحة التطبيق
-    healthCheckPath: /health
-    
-    # الموارد
-    plan: standard
+        sync: true
