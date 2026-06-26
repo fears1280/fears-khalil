@@ -3,6 +3,7 @@ import asyncio
 from flask import Flask, jsonify, request
 from metaapi_cloud_sdk import MetaApi
 from upstash_redis import Redis
+import traceback
 
 app = Flask(__name__)
 
@@ -33,6 +34,14 @@ def connect():
     cached_id = redis.get(f"acc:{login}")
     if cached_id:
         return jsonify({"status": "success", "account_id": cached_id, "source": "cache"}), 200
+
+    except Exception as e:
+        # هنا السحر: سنرسل تفاصيل الخطأ مباشرة إلى تطبيقك
+        return jsonify({
+            "status": "error", 
+            "message": str(e),
+            "traceback": traceback.format_exc() 
+        }), 500
 
     # منطق الاتصال (Async)
     async def init_connection():
