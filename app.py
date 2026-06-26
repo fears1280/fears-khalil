@@ -1,37 +1,29 @@
 import os
 import asyncio
-import logging
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask import Flask, jsonify, request
 from metaapi_cloud_sdk import MetaApi
 
-# إعداد الـ Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
 app = Flask(__name__)
-CORS(app)
-
 API_TOKEN = os.environ.get('METAAPI_TOKEN', '')
 
-# مسار الصفحة الرئيسية (مهم جداً لـ Render)
-@app.route('/', methods=['GET'])
+@app.route('/')
 def home():
-    return "The Trading Guardian is UP and RUNNING", 200
+    return "Service is UP", 200
 
-# مسار الاتصال
 @app.route('/api/connect', methods=['POST'])
 def connect():
     data = request.json or {}
     login = str(data.get('login'))
     password = str(data.get('password'))
     server = str(data.get('server'))
-    
-    if not all([login, password, server]):
-        return jsonify({"status": "error", "message": "بيانات ناقصة"}), 400
 
-    async def init_connection():
+    # تشغيل غير متزامن
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    async def process():
         api = MetaApi(API_TOKEN)
+        # الوصول المباشر
         account_api = api.metatrader_account_api
         
         # جلب الحسابات
@@ -55,17 +47,12 @@ def connect():
         return account.id
 
     try:
-        # تشغيل الـ Async داخل Context سيكرون
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        acc_id = loop.run_until_complete(init_connection())
-        loop.close()
-        
+        acc_id = loop.run_until_complete(process())
         return jsonify({"status": "success", "account_id": acc_id}), 200
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
+        loop.close()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=5000)
