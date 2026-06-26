@@ -6,3 +6,4 @@ python-socketio==4.6.1
 python-engineio==3.14.2
 metaapi-cloud-sdk>=29.0.0
 gunicorn==21.2.0
+asgiref>=3.7.0
