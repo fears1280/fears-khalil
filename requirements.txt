@@ -3,4 +3,3 @@ flask-cors
 metaapi-cloud-sdk
 gunicorn
 redis
-uvicorn
