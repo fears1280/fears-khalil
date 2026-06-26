@@ -3,9 +3,13 @@ services:
     name: trading-guardian-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --workers=2 --threads=4 --timeout=30 app:app
+    # رفع الـ timeout إلى 120 ثانية لضمان اكتمال المزامنة
+    # استخدام --worker-class gthread هو الأنسب لبيئة Flask مع Async
+    startCommand: gunicorn --worker-class gthread --workers 2 --threads 4 --timeout 120 app:app
     envVars:
       - key: METAAPI_TOKEN
-        sync: true
+        sync: false  # اجعلها false إذا كنت ستضيفها يدوياً في لوحة التحكم (أكثر أماناً)
       - key: REDIS_URL
-        sync: true
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
