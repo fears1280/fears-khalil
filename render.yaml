@@ -3,7 +3,7 @@ services:
     name: trading-guardian-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn --workers=2 --threads=4 --timeout=30 app:app
     envVars:
       - key: METAAPI_TOKEN
         sync: true
