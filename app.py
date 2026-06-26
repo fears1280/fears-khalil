@@ -37,7 +37,11 @@ socketio = SocketIO(
 
 # جلب الـ Token من متغيرات البيئة في Render
 API_TOKEN = os.environ.get('METAAPI_TOKEN', '')
-
+# فحص التوكن للتأكد من وصوله للسيرفر
+if not API_TOKEN:
+    print("❌ خطأ فادح: السيرفر لا يرى متغير METAAPI_TOKEN! تأكد من إضافته في Render.")
+else:
+    print(f"✅ تم قراءة التوكن بنجاح! يبدأ بـ: ({API_TOKEN[:5]}...)")
 # مخزن الجلسات النشطة في الذاكرة
 sessions = {}
 
