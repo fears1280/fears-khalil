@@ -102,90 +102,101 @@ def connect():
     
     try:
         async def register_account():
-            api = MetaApi(API_TOKEN)
-            account = None
-            
-            try:
-                print("🔄 Checking existing accounts on MetaApi...")
-                existing_accounts = await api.metatrader_account_api.get_accounts()
-                
-                if existing_accounts and isinstance(existing_accounts, list):
-                    for acc in existing_accounts:
-                        try:
-                            acc_login = None
-                            if isinstance(acc, dict):
-                                acc_login = acc.get('login')
-                            else:
-                                acc_login = getattr(acc, 'login', None) or (acc.get('login') if hasattr(acc, 'get') else None)
-                            
-                            if acc_login and str(acc_login) == str(login):
-                                account = acc
-                                print(f"♻️ Found existing MetaApi account for login: {login}")
-                                break
-                        except:
-                            continue
-            except Exception as check_error:
-                print(f"⚠️ Safe bypass: Quick check failed ({check_error}), proceeding to registration.")
-            
-            if not account:
-                print(f"✨ Creating new MetaApi account for login: {login}")
-                account = await api.metatrader_account_api.create_account({
-                    'name': f'Guardian_{login}',
-                    'type': 'cloud',
-                    'platform': 'mt5',
-                    'login': str(login),
-                    'password': str(password),
-                    'server': str(server),
-                    'magic': 999111,
-                    'keywords': ['trading-guardian']
-                })
-            
-            try:
-                account_state = account.state if hasattr(account, 'state') else account.get('state', '')
-                account_id = account.id if hasattr(account, 'id') else account.get('id')
-            except:
-                account_state = 'UNKNOWN'
-                account_id = getattr(account, 'id', None)
-                
-            if account_state != 'DEPLOYED':
-                await account.deploy()
-            
-            print("⏳ Waiting for account connection setup...")
-            await account.wait_connected(timeout_in_seconds=30)
-            
-            connection = account.get_rpc_connection()
-            await connection.connect()
-            await connection.wait_synchronized()
-            
-            account_info = await connection.get_account_information()
-            initial_balance = float(account_info.get('balance', 0.0))
-            
-            session_id = f"session_{login}_{int(time.time())}"
-            session_data = {
-                'session_id': session_id,
-                'account_id': account_id,
+    api = MetaApi(API_TOKEN)
+    account = None
+    
+    # محاولة البحث عن حساب موجود
+    try:
+        print("🔄 Checking existing accounts on MetaApi...")
+        existing_accounts = await api.metatrader_account_api.get_accounts()
+        for acc in existing_accounts:
+            acc_login = None
+            if isinstance(acc, dict):
+                acc_login = acc.get('login')
+            else:
+                acc_login = getattr(acc, 'login', None)
+            if acc_login and str(acc_login) == str(login):
+                account = acc
+                print(f"♻️ Found existing account for login: {login}")
+                break
+    except Exception as e:
+        print(f"⚠️ Could not fetch existing accounts: {e}")
+    
+    # إنشاء حساب جديد إذا لم يكن موجوداً
+    if not account:
+        print(f"✨ Creating new MetaApi account for login: {login}")
+        try:
+            account = await api.metatrader_account_api.create_account({
+                'name': f'Guardian_{login}',
+                'type': 'cloud',
+                'platform': 'mt5',
                 'login': str(login),
+                'password': str(password),
                 'server': str(server),
-                'status': 'connected',
-                'connected_at': datetime.now().isoformat(),
-                'daily_target': daily_target,
-                'max_loss_limit': max_loss_limit,
-                'is_locked': False,
-                'daily_profit': 0.0,
-                'daily_loss': 0.0,
-                'balance': initial_balance,
-                'equity': initial_balance,
-                'initial_balance': initial_balance
-            }
-            
-            save_session(session_id, session_data)
-            
-            return {
-                "status": "success",
-                "session_id": session_id,
-                "account_id": account_id,
-                "message": "تم الاتصال وتأمين الحساب بنجاح!"
-            }
+                'magic': 999111,
+                'keywords': ['trading-guardian']
+            })
+        except Exception as create_error:
+            print(f"❌ Account creation failed: {create_error}")
+            raise Exception(f"فشل إنشاء الحساب في MetaApi: {create_error}")
+    
+    # نشر الحساب
+    try:
+        account_state = account.state if hasattr(account, 'state') else account.get('state', '')
+        account_id = account.id if hasattr(account, 'id') else account.get('id')
+    except:
+        account_state = 'UNKNOWN'
+        account_id = getattr(account, 'id', None)
+        
+    if account_state != 'DEPLOYED':
+        print(f"⏳ Deploying account {account_id}...")
+        await account.deploy()
+    
+    # انتظار الاتصال بالبروكر (مع زيادة المهلة إلى 60 ثانية)
+    print(f"⏳ Waiting for account to connect to broker (timeout: 60s)...")
+    try:
+        await account.wait_connected(timeout_in_seconds=60)
+    except Exception as conn_error:
+        print(f"❌ Account failed to connect to broker: {conn_error}")
+        # إذا فشل الاتصال، فالمستخدم أدخل بيانات خاطئة
+        raise Exception("فشل الاتصال بالبروكر. تأكد من رقم الحساب، كلمة المرور، واسم السيرفر بدقة.")
+    
+    # إنشاء اتصال RPC
+    connection = account.get_rpc_connection()
+    await connection.connect()
+    await connection.wait_synchronized()
+    
+    # جلب معلومات الحساب
+    account_info = await connection.get_account_information()
+    initial_balance = float(account_info.get('balance', 0.0))
+    
+    # إنشاء الجلسة وحفظها
+    session_id = f"session_{login}_{int(time.time())}"
+    session_data = {
+        'session_id': session_id,
+        'account_id': account_id,
+        'login': str(login),
+        'server': str(server),
+        'status': 'connected',
+        'connected_at': datetime.now().isoformat(),
+        'daily_target': 500.0,
+        'max_loss_limit': -500.0,
+        'is_locked': False,
+        'daily_profit': 0.0,
+        'daily_loss': 0.0,
+        'balance': initial_balance,
+        'equity': initial_balance,
+        'initial_balance': initial_balance
+    }
+    
+    save_session(session_id, session_data)
+    
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "account_id": account_id,
+        "message": "تم الاتصال وتأمين الحساب بنجاح!"
+    }
         
         result = run_async(register_account())
         if result and result.get('status') == 'success':
