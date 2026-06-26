@@ -11,7 +11,7 @@ werkzeug.serving.run_with_reloader = lambda *args, **kwargs: None
 
 # ---------------------------------------------------------------------------
 # الآن استورد باقي مكتباتك المفضلة بأمان تسااام وبدون أي كراش!
-# --------------------------------
+# ---------------------------------------------------------------------------
 
 import os
 import asyncio
@@ -37,11 +37,13 @@ socketio = SocketIO(
 
 # جلب الـ Token من متغيرات البيئة في Render
 API_TOKEN = os.environ.get('METAAPI_TOKEN', '')
+
 # فحص التوكن للتأكد من وصوله للسيرفر
 if not API_TOKEN:
     print("❌ خطأ فادح: السيرفر لا يرى متغير METAAPI_TOKEN! تأكد من إضافته في Render.")
 else:
     print(f"✅ تم قراءة التوكن بنجاح! يبدأ بـ: ({API_TOKEN[:5]}...)")
+
 # مخزن الجلسات النشطة في الذاكرة
 sessions = {}
 
@@ -152,7 +154,47 @@ def on_join(data):
         print(f"📱 App connected and joined WebSocket room: {session_id}")
 
 # ---------------------------------------------------------------------------
-# دالة الاتصال وتهيئة الحساب لأول مرة (HTTP POST)
+# دالة مساعدة لتجميع عمليات MetaApi في تدفق (Stream) واحد وبـ Loop واحد
+# ---------------------------------------------------------------------------
+async def _handle_metaapi_connection(api, login, password, server):
+    account = None
+    
+    # 1️⃣ فحص وجود الحساب مسبقاً من خلال الـ API مباشرة
+    try:
+        existing_accounts = await api.metatrader_account_api.get_accounts()
+        if existing_accounts and isinstance(existing_accounts, list):
+            for acc in existing_accounts:
+                acc_login = acc.get('login') if isinstance(acc, dict) else getattr(acc, 'login', None)
+                if str(acc_login) == str(login):
+                    account = acc
+                    break
+    except Exception as ce:
+        print(f"⚠️ Quick check bypass: {ce}")
+    
+    # 2️⃣ إنشاء حساب جديد إن لم يكن موجوداً
+    if not account:
+        account = await api.metatrader_account_api.create_account({
+            'name': f'Guardian_{login}',
+            'type': 'cloud',
+            'platform': 'mt5',
+            'login': str(login),
+            'password': str(password),
+            'server': str(server),
+            'magic': 999111,
+            'keywords': ['trading-guardian']
+        })
+    
+    # 3️⃣ جلب بيانات الحساب وتفعيله إذا لم يكن مفعلاً
+    account_id = account.id if hasattr(account, 'id') else account.get('id')
+    account_state = account.state if hasattr(account, 'state') else account.get('state', '')
+    
+    if account_state != 'DEPLOYED':
+        await account.deploy()
+        
+    return account_id
+
+# ---------------------------------------------------------------------------
+# دالة الاتصال وتهيئة الحساب لأول مرة (HTTP POST) بعد الإصلاح
 # ---------------------------------------------------------------------------
 @app.route('/api/connect', methods=['POST'])
 def connect():
@@ -172,42 +214,20 @@ def connect():
         return jsonify({"status": "error", "message": "بيانات غير كاملة"}), 400
     
     if not API_TOKEN:
-        return jsonify({"status": "error", "message": "METAAPI_TOKEN غير معرف"}), 500
+        return jsonify({"status": "error", "message": "METAAPI_TOKEN غير معرف في البيئة"}), 500
     
     try:
         api = MetaApi(API_TOKEN)
-        account = None
         
-        # فحص وجود الحساب مسبقاً
-        try:
-            existing_accounts = asyncio.run(api.metatrader_account_api.get_accounts())
-            if existing_accounts and isinstance(existing_accounts, list):
-                for acc in existing_accounts:
-                    acc_login = acc.get('login') if isinstance(acc, dict) else getattr(acc, 'login', None)
-                    if str(acc_login) == str(login):
-                        account = acc
-                        break
-        except Exception as ce:
-            print(f"⚠️ Quick check bypass: {ce}")
+        # إنشاء Event Loop مخصص ونظيف لهذه العملية بالتحديد لمنع تداخل الجلسات
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        # إنشاء حساب جديد إن لم يكن موجوداً
-        if not account:
-            account = asyncio.run(api.metatrader_account_api.create_account({
-                'name': f'Guardian_{login}',
-                'type': 'cloud',
-                'platform': 'mt5',
-                'login': str(login),
-                'password': str(password),
-                'server': str(server),
-                'magic': 999111,
-                'keywords': ['trading-guardian']
-            }))
-        
-        account_id = account.id if hasattr(account, 'id') else account.get('id')
-        account_state = account.state if hasattr(account, 'state') else account.get('state', '')
-        
-        if account_state != 'DEPLOYED':
-            asyncio.run(account.deploy())
+        # تشغيل كل مهام الـ MetaApi المتتابعة داخل نفس دورة الحياة (Loop الواحد)
+        account_id = loop.run_until_complete(
+            _handle_metaapi_connection(api, login, password, server)
+        )
+        loop.close() # إغلاق آمن بعد انتهاء المهام بنجاح وبدون تدمير الجلسات
         
         # توليد رقم جلسة فريد وتخزينه
         session_id = f"session_{login}_{int(time.time())}"
@@ -225,14 +245,14 @@ def connect():
             'equity': 0.0
         }
         
-        # 🔥 إطلاق أنبوب البث الحي فوراً في الخلفية
+        # 🔥 إطلاق أنبوب البث الحي فوراً في الخلفية عبر خيط (Thread) منفصل وآمن
         threading.Thread(target=start_async_stream, args=(session_id, account_id), daemon=True).start()
         
         return jsonify({
             "status": "success",
             "session_id": session_id,
             "account_id": account_id,
-            "message": "تم الاتصال وتفعيل بث الحماية اللحظي!"
+            "message": "تم الاتصال وتفعيل بث الحماية اللحظي بنجاح!"
         }), 201
         
     except Exception as e:
