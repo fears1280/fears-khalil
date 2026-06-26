@@ -10,7 +10,7 @@ flask._request_ctx_stack = LocalStack()
 werkzeug.serving.run_with_reloader = lambda *args, **kwargs: None
 
 # ---------------------------------------------------------------------------
-# الآن استورد باقي مكتباتك المفضلة بأمان تسااام وبدون أي كراش!
+# استيراد المكتبات بشكل آمن ومستقر
 # ---------------------------------------------------------------------------
 
 import os
@@ -64,7 +64,6 @@ async def stream_account_metrics(session_id, account_id):
         
         print(f"🚀 Started Live WebSocket Streaming for Session: {session_id}")
         
-        # حلقة فحص وبث متواصلة كل ثانية واحدة لسرعة البرق
         while session_id in sessions:
             if not sessions[session_id].get('active', True):
                 break
@@ -84,7 +83,7 @@ async def stream_account_metrics(session_id, account_id):
             drawdown_percent = abs((pnl / balance) * 100) if pnl < 0 else 0.0
             overall_growth = ((balance - initial) / initial) * 100 if initial > 0 else 0.0
 
-            # 🛑 الردع الصارم: إذا كان الحساب مقفولاً وقام المستخدم بفتح صفقة يدوياً من الميتا
+            # الردع الصارم لإغلاق الصفقات غير القانونية في حال قفل الحساب
             if session_data.get('is_locked') and len(positions) > 0:
                 print(f"🚨 LOCKOUT VIOLATION! Closing illegal positions immediately.")
                 for pos in positions:
@@ -96,13 +95,13 @@ async def stream_account_metrics(session_id, account_id):
                 pnl = 0.0
                 drawdown_percent = 0.0
 
-            # 📈 الفحص التلقائي للهدف والخسارة من جهة السيرفر
+            # الفحص التلقائي للأهداف والخسائر
             if not session_data.get('is_locked'):
                 daily_target = session_data.get('daily_target', 500.0)
                 max_loss_limit = session_data.get('max_loss_limit', -500.0)
                 
                 if pnl >= daily_target or pnl <= max_loss_limit:
-                    print(f"🎯 Target or Stop reached on server side! Locking down account.")
+                    print(f"🎯 Target or Stop reached! Locking down account.")
                     session_data['is_locked'] = True
                     for pos in positions:
                         try:
@@ -113,7 +112,7 @@ async def stream_account_metrics(session_id, account_id):
                     pnl = 0.0
                     drawdown_percent = 0.0
 
-            # ⚡ ضخ البيانات فوراً إلى تطبيق فلاتر عبر الـ WebSocket Room
+            # ضخ البيانات إلى تطبيق فلاتر
             socketio.emit('metrics_update', {
                 'session_id': session_id,
                 'is_locked': session_data.get('is_locked', False),
@@ -126,12 +125,11 @@ async def stream_account_metrics(session_id, account_id):
                 'open_trades': len(positions)
             }, to=session_id)
             
-            await asyncio.sleep(1) # فحص مستمر كل ثانية
+            await asyncio.sleep(1)
             
     except Exception as e:
         print(f"❌ Streaming Error on session {session_id}: {e}")
 
-# دالة لتشغيل البث في خيط معزول وآمن ومحمي من الكراش
 def start_async_stream(session_id, account_id):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -142,59 +140,61 @@ def start_async_stream(session_id, account_id):
     finally:
         loop.close()
 
-# ---------------------------------------------------------------------------
-# غرف الـ WebSockets (Rooms) لفرز اتصالات المستخدمين
-# ---------------------------------------------------------------------------
 @socketio.on('join')
 def on_join(data):
     session_id = data.get('session_id')
     if session_id:
         from flask_socketio import join_room
         join_room(session_id)
-        print(f"📱 App connected and joined WebSocket room: {session_id}")
+        print(f"📱 App joined WebSocket room: {session_id}")
 
 # ---------------------------------------------------------------------------
-# دالة مساعدة لتجميع عمليات MetaApi في تدفق (Stream) واحد وبـ Loop واحد
+# دالة معالجة الاتصال بـ MetaApi (محدثة لتصحيح أنواع البيانات)
 # ---------------------------------------------------------------------------
-async def _handle_metaapi_connection(api, login, password, server):
+async def _handle_metaapi_connection(api, login_int, password, server):
     account = None
     
-    # 1️⃣ فحص وجود الحساب مسبقاً من خلال الـ API مباشرة
+    # 1️⃣ محاولة فحص إذا كان الحساب مضافاً مسبقاً
     try:
         existing_accounts = await api.metatrader_account_api.get_accounts()
         if existing_accounts and isinstance(existing_accounts, list):
             for acc in existing_accounts:
-                acc_login = acc.get('login') if isinstance(acc, dict) else getattr(acc, 'login', None)
-                if str(acc_login) == str(login):
+                acc_login = acc.login if hasattr(acc, 'login') else acc.get('login', None)
+                if str(acc_login) == str(login_int):
                     account = acc
                     break
     except Exception as ce:
         print(f"⚠️ Quick check bypass: {ce}")
     
-    # 2️⃣ إنشاء حساب جديد إن لم يكن موجوداً
+    # 2️⃣ إنشاء حساب جديد (تم تحويل الـ login إلى int إجباري لمنع رفض الـ SDK للطلب)
     if not account:
         account = await api.metatrader_account_api.create_account({
-            'name': f'Guardian_{login}',
+            'name': f'Guardian_{login_int}',
             'type': 'cloud',
             'platform': 'mt5',
-            'login': str(login),
+            'login': int(login_int),  # رقم صحيح إلزامي هنا لـ MetaApi
             'password': str(password),
             'server': str(server),
             'magic': 999111,
             'keywords': ['trading-guardian']
         })
     
-    # 3️⃣ جلب بيانات الحساب وتفعيله إذا لم يكن مفعلاً
+    # جلب المعرف وحالة الحساب الحالية بشكل آمن
     account_id = account.id if hasattr(account, 'id') else account.get('id')
     account_state = account.state if hasattr(account, 'state') else account.get('state', '')
     
+    # 3️⃣ تفعيل الحساب وعمل Deploy له إذا لم يكن مفعلاً
     if account_state != 'DEPLOYED':
-        await account.deploy()
+        if hasattr(account, 'deploy'):
+            await account.deploy()
+        else:
+            fresh_account = await api.metatrader_account_api.get_account(account_id)
+            await fresh_account.deploy()
         
     return account_id
 
 # ---------------------------------------------------------------------------
-# دالة الاتصال وتهيئة الحساب لأول مرة (HTTP POST) بعد الإصلاح
+# دالة الـ API الأساسية للتسجيل (HTTP POST)
 # ---------------------------------------------------------------------------
 @app.route('/api/connect', methods=['POST'])
 def connect():
@@ -202,6 +202,12 @@ def connect():
     login = data.get('login')
     password = data.get('password')
     server = data.get('server')
+    
+    # التحقق من صحة رقم الـ login وتحويله لرقم صحيح لمنع كراش السيرفر الداخلي
+    try:
+        login_int = int(login)
+    except (ValueError, TypeError):
+        return jsonify({"status": "error", "message": "رقم الـ Login غير صحيح، يجب أن يتكون من أرقام فقط"}), 400
     
     try:
         daily_target = float(data.get('daily_target', 500.0))
@@ -211,30 +217,31 @@ def connect():
         max_loss_limit = -500.0
     
     if not all([login, password, server]):
-        return jsonify({"status": "error", "message": "بيانات غير كاملة"}), 400
+        return jsonify({"status": "error", "message": "بيانات غير كاملة، يرجى ملء جميع الحقول"}), 400
     
     if not API_TOKEN:
-        return jsonify({"status": "error", "message": "METAAPI_TOKEN غير معرف في البيئة"}), 500
+        return jsonify({"status": "error", "message": "METAAPI_TOKEN غير معرف في لوحة تحكم Render"}), 500
     
     try:
-        api = MetaApi(API_TOKEN)
-        
-        # إنشاء Event Loop مخصص ونظيف لهذه العملية بالتحديد لمنع تداخل الجلسات
+        # أ) إنشاء الـ Event Loop أولاً وتفعيله في الخيط الحالي
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # تشغيل كل مهام الـ MetaApi المتتابعة داخل نفس دورة الحياة (Loop الواحد)
-        account_id = loop.run_until_complete(
-            _handle_metaapi_connection(api, login, password, server)
-        )
-        loop.close() # إغلاق آمن بعد انتهاء المهام بنجاح وبدون تدمير الجلسات
+        # ب) تهيئة كائن الـ MetaApi *داخل* بيئة الـ Loop النشط لربط الـ sessions بشكل سليم
+        api = MetaApi(API_TOKEN)
         
-        # توليد رقم جلسة فريد وتخزينه
-        session_id = f"session_{login}_{int(time.time())}"
+        # ج) تنفيذ المهام في تدفق برمي واحد متكامل وبدون انقطاع
+        account_id = loop.run_until_complete(
+            _handle_metaapi_connection(api, login_int, password, server)
+        )
+        loop.close()  # إغلاق آمن للـ Loop بعد النجاح
+        
+        # توليد رقم جلسة فريد وتخزينه في الذاكرة
+        session_id = f"session_{login_int}_{int(time.time())}"
         sessions[session_id] = {
             'session_id': session_id,
             'account_id': account_id,
-            'login': str(login),
+            'login': str(login_int),
             'server': str(server),
             'active': True,
             'is_locked': False,
@@ -245,7 +252,7 @@ def connect():
             'equity': 0.0
         }
         
-        # 🔥 إطلاق أنبوب البث الحي فوراً في الخلفية عبر خيط (Thread) منفصل وآمن
+        # إطلاق أنبوب البث الحي اللحظي في الخلفية
         threading.Thread(target=start_async_stream, args=(session_id, account_id), daemon=True).start()
         
         return jsonify({
@@ -256,11 +263,12 @@ def connect():
         }), 201
         
     except Exception as e:
-        print(f"Critical Connection Error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        # طباعة الخطأ الفعلي كاملاً في سيرفر Render لمعرفته بدقة
+        print(f"❌ Critical Connection Error: {str(e)}")
+        return jsonify({"status": "error", "message": f"خطأ في الاتصال بـ MetaApi: {str(e)}"}), 500
 
 # ---------------------------------------------------------------------------
-# باقي دالات التحكم (HTTP POST) لتحديث الأهداف أو الفصل
+# باقي دالات التحكم للتحديث والفصل
 # ---------------------------------------------------------------------------
 @app.route('/api/update-targets', methods=['POST'])
 def update_targets():
@@ -285,5 +293,4 @@ def disconnect():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    # تشغيل السيرفر الاحترافي الداعم للـ WebSockets والـ Gunicorn معاً
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
