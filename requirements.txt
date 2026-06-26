@@ -2,4 +2,4 @@ Flask==3.0.0
 gunicorn==21.2.0
 metaapi-cloud-sdk==29.1.1
 flask-cors==4.0.0
-# Force Full Rebuild 2026
+upstash-redis==2.4.0
