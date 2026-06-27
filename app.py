@@ -17,9 +17,9 @@ async def register_meta_account():
             'name': 'My_Demo_Account',
             'type': 'cloud',          # دائماً cloud لتشغيل السيرفر بالخلفية
             'platform': 'mt5',        # أو 'mt4' حسب حسابك
-            'login': '12345678',      # رقم حساب التداول الخاص بك
-            'password': 'password',    # كلمة سر الحساب
-            'server': 'MetaQuotes-Demo' # اسم السيرفر بالكامل وبدقة
+            'login': '1200105499',      # رقم حساب التداول الخاص بك
+            'password': '12345@Feras',    # كلمة سر الحساب
+            'server': 'justmarkets -Demo3' # اسم السيرفر بالكامل وبدقة
         })
 
         print(f"✓ تم إنشاء الحساب بنجاح برقم داخلي: {account.id}")
