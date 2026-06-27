@@ -1,7 +1,7 @@
 import asyncio
 from metaapi_cloud_sdk import MetaApi
 
-# ضع التوكن الخاص بك هنا
+# ضع التوكن الحقيقي الخاص بك هنا بدلاً من النص
 API_TOKEN = "ضع_التوكن_الخاص_بك_هنا"
 
 async def register_meta_account():
@@ -12,19 +12,19 @@ async def register_meta_account():
     try:
         print("⏳ جاري إرسال البيانات وإنشاء الحساب على سيرفرات MetaAPI...")
         
-        # 2. إدخال بيانات الحساب التجريبي (Demo)
+        # 2. إدخال بيانات الحساب التجريبي (Demo) بعد التعديل
         account = await account_api.create_account({
             'name': 'My_Demo_Account',
-            'type': 'cloud',          # دائماً cloud لتشغيل السيرفر بالخلفية
-            'platform': 'mt5',        # أو 'mt4' حسب حسابك
-            'login': '1200105499',      # رقم حساب التداول الخاص بك
-            'password': '12345@Feras',    # كلمة سر الحساب
-            'server': 'justmarkets -Demo3' # اسم السيرفر بالكامل وبدقة
+            'type': 'cloud',          
+            'platform': 'mt5',        
+            'login': '1200105499',      
+            'password': '12345@Feras',    
+            'server': 'JustMarkets-Demo3'  # تم تعديل الاسم ليكون دقيقاً وبدون فراغات عشوائية
         })
 
         print(f"✓ تم إنشاء الحساب بنجاح برقم داخلي: {account.id}")
         
-        # 3. تفعيل الحساب (Deploy) وهو ضروري جداً ليصبح الـ ID جاهزاً للعمل
+        # 3. تفعيل الحساب (Deploy)
         print("⏳ جاري تفعيل وتشغيل السيرفر السحابي للحساب (Deploy)...")
         await account.deploy()
         
@@ -32,7 +32,7 @@ async def register_meta_account():
         await account.wait_connected(timeout_in_seconds=60)
         
         print("\n" + "="*40)
-        print("🎉 الحساب جاهز ونشط الآن!")
+        print("🎉 الحساب جاهز ونشط الآن واشتغل 100%!")
         print(f"👉 Account ID: {account.id}")
         print("="*40)
 
